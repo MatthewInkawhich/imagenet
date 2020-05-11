@@ -4,6 +4,7 @@ import random
 import shutil
 import time
 import warnings
+import yaml
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,8 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from models import strider
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -25,13 +28,13 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 #parser.add_argument('data', metavar='DIR',
 #                    help='path to dataset')
-parser.add_argument('out', metavar='DIR',
-                    help='path to output')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
-                    choices=model_names,
-                    help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet18)')
+parser.add_argument('config', metavar='FILE',
+                    help='path to config file')
+#parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
+#                    choices=model_names,
+#                    help='model architecture: ' +
+#                        ' | '.join(model_names) +
+#                        ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
@@ -82,6 +85,18 @@ best_acc1 = 0
 def main():
     args = parser.parse_args()
 
+    # Load config file
+    if not os.path.isfile(args.config):
+        print("Error: Config file: {} does not exist".format(args.config))
+        exit()
+    with open(args.config, "r") as yamlfile:
+        args.model_cfg = yaml.load(yamlfile, Loader=yaml.FullLoader)
+    args.outdir = './out/' + args.config.split('/')[-1].split('.')[0]
+
+    print("args.config:", args.config)
+    print("args.outdir:", args.outdir)
+    print("args.model_cfg:", args.model_cfg)
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -130,13 +145,23 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+    
     # create model
-    if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
+    model_name = args.model_cfg['MODEL']
+    if model_name in model_names:
+        print("Using model from torchvision.models: {}".format(model_name))
+        if args.pretrained:
+            print("=> using pre-trained model '{}'".format(model_name))
+            model = models.__dict__[model_name](pretrained=True)
+        else:
+            print("=> creating model '{}'".format(model_name))
+            model = models.__dict__[model_name]()
+    elif model_name == 'strider':
+        print("Using custom model: {}".format(model_name))
+        model = strider.StriderClassifier(args.model_cfg['STRIDER'])
     else:
-        print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+        print("Error: Model: {} not recognized!".format(model_name))
+        exit()
 
 
     print(model)
@@ -168,7 +193,7 @@ def main_worker(gpu, ngpus_per_node, args):
         model = model.cuda(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+        if model_name.startswith('alexnet') or model_name.startswith('vgg'):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
         else:
@@ -206,10 +231,10 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    #traindir = os.path.join(args.data, 'train')
-    #valdir = os.path.join(args.data, 'val')
     traindir = '/zero1/data1/ILSVRC2012/train/original'
+    #traindir = './data/ILSVRC2012_val' 
     valdir = './data/ILSVRC2012_val' 
+
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -264,11 +289,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 and args.rank % ngpus_per_node == 0):
             save_checkpoint({
                 'epoch': epoch + 1,
-                'arch': args.arch,
+                'arch': model_name,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best, outdir=args.out, filename='checkpoint.pth.tar')
+            }, is_best, outdir=args.outdir, filename='checkpoint.pth.tar')
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -366,7 +391,7 @@ def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pt
     if not os.path.exists(outdir):
         os.makedirs(outdir)
     filepath = os.path.join(outdir, filename)
-    print("Saving checkpoint to {}: ".format(filepath))
+    print("Saving checkpoint to: {} ".format(filepath))
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(outdir, 'model_best.pth.tar'))
