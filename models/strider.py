@@ -88,9 +88,9 @@ class StriderClassifier(nn.Module):
         x = self.body(x)
         #print("backbone out:")
         #for i in range(len(x)):
-        #    print("\ni:", i)
-        #    print("shape:", x[i].shape)
-        #    print("mean activation:", x[i].mean())
+            #print("\ni:", i)
+            #print("shape:", x[i].shape)
+            #print("mean activation:", x[i].mean())
 
         # Forward thru FPN
         if self.use_fpn:
@@ -159,6 +159,9 @@ class Strider(nn.Module):
         sb_adaptive_fusion = cfg['SB_ADAPTIVE_FUSION']
         lr_adaptive_fusion = cfg['LR_ADAPTIVE_FUSION']
         fpn_adaptive_fusion = cfg['FPN_ADAPTIVE_FUSION']
+
+
+        ### Construct blocks
         for i in range(len(body_channels)):
             name = "block" + str(i)
             in_channels = body_channels[i][0]
@@ -196,8 +199,35 @@ class Strider(nn.Module):
             self.return_features[name] = return_features[i]
 
 
+        ### Construct LRR layers
+        # Construct lr_residual_dict as we go
+        self.lr_residual_dict = {}
+        for l in range(len(body_channels)):
+            self.lr_residual_dict[l] = []
+            for lrr in lr_residual:
+                p = l - lrr
+                if p >= 0:
+                    name = ""
+                    # Only construct/use a lrr_module if output depth does not match
+                    if body_channels[l][2] != body_channels[p][2]:
+                        # Naming convention: to_ENDINDEX_from_SOURCEINDEX
+                        name = "lrr_to_{}_from_{}".format(l, p)
+                        lrr_module = nn.Sequential(
+                            Conv2d(
+                                body_channels[p][2],
+                                body_channels[l][2],
+                                kernel_size=1,
+                                bias=False,
+                            ),
+                            self.norm_func(body_channels[l][2]))
+                        self.add_module(name, lrr_module)
+                    self.lr_residual_dict[l].append((p, name))
 
-        # Initialize layers
+        print("lr_residual_dict:")
+        for k, v in self.lr_residual_dict.items():
+            print(k, v)
+
+        ### Manually initialize layers
         for n, m in self.named_modules():
             #print("\nn:", n)
             #print("m:", m)
@@ -224,16 +254,33 @@ class Strider(nn.Module):
                 nn.init.normal_(m.conv.weight, std=0.01)
                 nn.init.constant_(m.conv.bias, 0)
 
-        
 
     def forward(self, x):
         #print("input:", x.shape)
+        all_outputs = []
         outputs = []
+        # Forward thru stem
         x = self.stem(x)
         #print("stem:", x.shape, x.mean())
         for i, block_name in enumerate(self.block_names):
+            # Forward thru current block
             x = getattr(self, block_name)(x, self.output_indexes[i])
-            #print(i, block_name, x.shape, x.mean())
+            # Perform long range residual fusion
+            for (lrr_idx, lrr_name) in self.lr_residual_dict[i]:
+                lrr_feat = all_outputs[lrr_idx]
+                # First, process the lrr feature
+                lrr_feat = FeatureResize(lrr_feat, x.shape[-2:])
+                if lrr_name:
+                    lrr_feat = getattr(self, lrr_name)(lrr_feat)
+                # Next, add the lrr_feat to x
+                x += lrr_feat
+            # Normalize the fusion; only perform if fusion was done
+            if self.lr_residual_dict[i]:
+                x /= len(self.lr_residual_dict[i])
+            # Perform nonlinearity AFTER fusion
+            x = F.relu(x)
+
+            all_outputs.append(x)
             if self.return_features[block_name]:
                 #print("Adding to return list")
                 outputs.append(x)
@@ -492,7 +539,7 @@ class StriderBlockv2(nn.Module):
             identity = self.downsample(identity)
         identity = FeatureResize(identity, output_resolution)
         out += identity
-        out = F.relu(out)
+        #out = F.relu(out) # Commenting this out because Strider with LRR connections takes care of this in Strider forward
         
         return out
 
