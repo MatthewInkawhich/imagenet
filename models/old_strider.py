@@ -48,7 +48,7 @@ def FeatureResize(x, target_resolution):
 
 
 ################################################################################
-### Strider Classifier Module
+### Strider Backbone Module
 ################################################################################
 class StriderClassifier(nn.Module):
     def __init__(self, cfg, num_classes=1000):
@@ -56,6 +56,7 @@ class StriderClassifier(nn.Module):
 
         # Assert correct config format
         assert (len(cfg['BODY_CHANNELS']) == len(cfg['BODY_CONFIG'])), "Body channels config must equal body config"
+        assert (len(cfg['BODY_CHANNELS']) == len(cfg['OUTPUT_INDEXES'])), "Body channels config must equal output indexes"
         assert (len(cfg['BODY_CHANNELS']) == len(cfg['RETURN_FEATURES'])), "Body channels config must equal return features"
 
         # Build Strider backbone
@@ -112,6 +113,7 @@ class StriderClassifier(nn.Module):
                 exit()
             out = x[0]
 
+
         #print("out:", out.shape, out.mean())
         #exit()
 
@@ -138,27 +140,35 @@ class Strider(nn.Module):
         self.norm_func = nn.BatchNorm2d
 
         # Construct Stem
-        self.stem = Stem(cfg['STEM_CHANNELS'], self.norm_func)
+        if cfg['STEM_CONFIG'] == "BASE":
+            self.stem = BaseStem(cfg['STEM_CHANNELS'][0], self.norm_func)
+        else:
+            self.stem = Stem(cfg['STEM_CONFIG'], cfg['STEM_CHANNELS'], self.norm_func)
 
         # Construct Blocks
         self.block_names = []
         self.return_features = {}
+        self.output_indexes = cfg['OUTPUT_INDEXES']
+        version = cfg['VERSION']
         body_channels = cfg['BODY_CHANNELS']
         body_config = cfg['BODY_CONFIG']
+        branch_config = cfg['BRANCH_CONFIG']
         return_features = cfg['RETURN_FEATURES']
-        ss_channels = cfg['SS_CHANNELS']
         full_residual = cfg['FULL_RESIDUAL']
         lr_residual = cfg['LR_RESIDUAL']
+        sb_adaptive_fusion = cfg['SB_ADAPTIVE_FUSION']
         lr_adaptive_fusion = cfg['LR_ADAPTIVE_FUSION']
         fpn_adaptive_fusion = cfg['FPN_ADAPTIVE_FUSION']
 
+
+        ### Construct blocks
         for i in range(len(body_channels)):
             name = "block" + str(i)
             in_channels = body_channels[i][0]
             bottleneck_channels = body_channels[i][1]
             out_channels = body_channels[i][2]
 
-            # If the current element is 0, build a regular Bottleneck
+            # If the current element of reg_bottlenecks is not empty, build a regular Bottleneck
             if body_config[i][0] == 0:
                 stride = body_config[i][1][0]
                 dilation = body_config[i][1][1]
@@ -174,13 +184,14 @@ class Strider(nn.Module):
             
             # Else, build a StriderBlock
             else:
-                block = StriderBlock(
+                block = StriderBlockv2(
                             in_channels=in_channels,
                             bottleneck_channels=bottleneck_channels,
-                            ss_channels=ss_channels,
                             out_channels=out_channels,
+                            branch_config = branch_config,
                             norm_func=self.norm_func,
                             full_residual=full_residual,
+                            adaptive_fusion=sb_adaptive_fusion,
                         )
 
             self.add_module(name, block)
@@ -208,15 +219,13 @@ class Strider(nn.Module):
                                 kernel_size=1,
                                 bias=False,
                             ),
-                            self.norm_func(body_channels[l][2])
-                        )
+                            self.norm_func(body_channels[l][2]))
                         self.add_module(name, lrr_module)
                     self.lr_residual_dict[l].append((p, name))
 
         print("lr_residual_dict:")
         for k, v in self.lr_residual_dict.items():
             print(k, v)
-
 
         ### Manually initialize layers
         for n, m in self.named_modules():
@@ -232,11 +241,11 @@ class Strider(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
         
-        for n, p in self.named_parameters():
-            #print("\nn:", n)
-            if 'conv2_weight' in n:
-                #print("Initializing conv2_weight parameter")
-                nn.init.kaiming_normal_(p, mode='fan_out', nonlinearity='relu')
+        #for n, p in self.named_parameters():
+        #    #print("\nn:", n)
+        #    if 'conv2_weight' in n:
+        #        #print("Initializing conv2_weight parameter")
+        #        nn.init.kaiming_normal_(p, mode='fan_out', nonlinearity='relu')
 
 
         # Initialize specialty layers
@@ -244,7 +253,6 @@ class Strider(nn.Module):
             if isinstance(m, AdaptiveFusionModule):
                 nn.init.normal_(m.conv.weight, std=0.01)
                 nn.init.constant_(m.conv.bias, 0)
-
 
 
     def forward(self, x):
@@ -256,8 +264,7 @@ class Strider(nn.Module):
         #print("stem:", x.shape, x.mean())
         for i, block_name in enumerate(self.block_names):
             # Forward thru current block
-            x = getattr(self, block_name)(x)
-            #print("block{}".format(i), x.shape)
+            x = getattr(self, block_name)(x, self.output_indexes[i])
             # Perform long range residual fusion
             for (lrr_idx, lrr_name) in self.lr_residual_dict[i]:
                 lrr_feat = all_outputs[lrr_idx]
@@ -294,11 +301,46 @@ class Strider(nn.Module):
 ### Stem
 ################################################################################
 class Stem(nn.Module):
-    def __init__(self, out_channels, norm_func):
+    """
+    Stem module
+    Use group norm
+    """
+    def __init__(self, stem_config, stem_channels, norm_func):
         super(Stem, self).__init__()
+
+        # Initialize layers
+        layers = []
+
+        # Iterate over stem_config, build stem
+        in_channels = 3
+        for i in range(len(stem_channels)):
+            # Construct padding
+            pad_tuple = get_pad_tuple(stem_config[i][2])
+            layers.append(nn.ZeroPad2d(pad_tuple))
+            # Construct layer
+            conv = Conv2d(in_channels, stem_channels[i], kernel_size=stem_config[i][0], stride=stem_config[i][1], bias=False)
+            layers.append(conv)
+            # Initialize norm
+            layers.append(norm_func(stem_channels[i]))
+            # Initialize nonlinearity
+            layers.append(nn.ReLU(inplace=True))
+            # Update in_channels
+            in_channels = stem_channels[i]
+
+        # Combine layers into module
+        self.layers = nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+
+class BaseStem(nn.Module):
+    def __init__(self, out_channels, norm_func):
+        super(BaseStem, self).__init__()
         # Define conv layer
         self.conv1 = Conv2d(3, out_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        #self.conv1 = Conv2d(3, out_channels, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = norm_func(out_channels)
 
     def forward(self, x):
@@ -333,44 +375,28 @@ class AdaptiveFusionModule(nn.Module):
 
 
 ################################################################################
-### StrideSelectorModule
+### StriderBlockv2
 ################################################################################
-class StrideSelectorModule(nn.Module):
-    def __init__(self, in_channels, intermediate_channels, num_stride_options, norm_func):
-        super(StrideSelectorModule, self).__init__()
-        self.conv1 = Conv2d(in_channels, intermediate_channels, kernel_size=3, stride=1, padding=1)
-        self.bn1 = norm_func(intermediate_channels)
-        self.conv2 = Conv2d(intermediate_channels, intermediate_channels, kernel_size=3, stride=1, padding=1)
-        self.bn2 = norm_func(intermediate_channels)
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(intermediate_channels, num_stride_options)
-
-    def forward(self, x):
-        # Convs
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        # GAP
-        x = self.gap(x)
-        x = torch.flatten(x, 1)
-        # FC
-        x = self.fc(x)
-        return x
-
-
-################################################################################
-### StriderBlock
-################################################################################
-class StriderBlock(nn.Module):
+class StriderBlockv2(nn.Module):
     def __init__(
         self,
         in_channels,
         bottleneck_channels,
-        ss_channels,
         out_channels,
+        branch_config,
         norm_func,
         full_residual=False,
+        adaptive_fusion=False,
     ):
-        super(StriderBlock, self).__init__()
+        super(StriderBlockv2, self).__init__()
+        
+        self.branch_config = branch_config
+        self.num_branches = len(branch_config)
+        self.adaptive_fusion = adaptive_fusion
+
+        ### Initialize Weighted Fusion Module if necessary
+        if self.adaptive_fusion:
+            self.afm = AdaptiveFusionModule(in_channels, num_branches=self.num_branches)
 
         ### Residual layer
         self.downsample = None
@@ -395,19 +421,52 @@ class StriderBlock(nn.Module):
         
 
         ### Conv2 
-        self.conv2_stride_options = [
-            [False, (1, 1)],
-            [False, (1, 2)],
-            [False, (2, 1)],
-            [False, (2, 2)],
-            [True, (1, 2)],
-            [True, (2, 1)],
-            [True, (2, 2)],
-        ]
-        self.ss = StrideSelectorModule(bottleneck_channels, ss_channels, len(self.conv2_stride_options), norm_func)
-        self.conv2_weight = nn.Parameter(
-            torch.Tensor(bottleneck_channels, bottleneck_channels, 3, 3))
-        self.bn2 = norm_func(bottleneck_channels)
+        # The Conv2 stage consists of parallel branches with different strides/dilations
+        conv2_subchannels = math.ceil(bottleneck_channels / self.num_branches)
+
+        for i in range(self.num_branches):
+            transposed = self.branch_config[i][0]
+            stride = tuple(self.branch_config[i][1])
+            dilation = tuple(self.branch_config[i][2])
+        
+            # Construct 3x3 conv
+            if transposed:
+                conv2 = ConvTranspose2d(
+                    bottleneck_channels,
+                    conv2_subchannels,
+                    kernel_size=3,
+                    stride=stride,
+                    dilation=dilation,
+                    padding=dilation,
+                    output_padding=1,
+                    bias=False,
+                )
+
+            else:
+                conv2 = Conv2d(
+                    bottleneck_channels,
+                    conv2_subchannels,
+                    kernel_size=3,
+                    stride=stride,
+                    dilation=dilation,
+                    padding=dilation,
+                    bias=False,
+                )
+            bn2 = norm_func(conv2_subchannels)
+
+            # Construct Resize layers
+            resize = Conv2d(
+                conv2_subchannels,
+                bottleneck_channels,
+                kernel_size=1,
+                bias=False,
+            )
+            bnr = norm_func(bottleneck_channels)
+
+            self.add_module("conv2_{}".format(i), conv2)
+            self.add_module("bn2_{}".format(i), bn2)
+            self.add_module("resize_{}".format(i), resize)
+            self.add_module("bnr_{}".format(i), bnr)
 
 
         ### Conv3
@@ -421,7 +480,7 @@ class StriderBlock(nn.Module):
 
 
 
-    def forward(self, x, epsilon):
+    def forward(self, x, output_index):
         # Store copy of input feature
         identity = x
 
@@ -430,24 +489,46 @@ class StriderBlock(nn.Module):
         out = self.bn1(out)
         conv1_out = F.relu(out)
     
-        # Forward thru Stride Selector Module
-        stride_selection = 0
-        ss_out = self.ss(conv1_out)
+        ### Forward thru conv2
+        # Forward thru 3x3s
+        conv2_branch_outputs = []
+        for i in range(self.num_branches):
+            out = getattr(self, "conv2_"+str(i))(conv1_out)
+            out = getattr(self, "bn2_"+str(i))(out)
+            out = F.relu(out)
+            conv2_branch_outputs.append(out)
 
+        # Store desired output resolution
+        output_resolution = conv2_branch_outputs[output_index].shape[-2:]
 
+        #print("\nBefore resize:")
+        #for i in range(self.num_branches):
+        #    print(i, conv2_branch_outputs[i].shape)
 
+        # Forward thru AFM if necessary
+        if self.adaptive_fusion:
+            fusion_weights = self.afm(identity, output_resolution)
 
-        # Forward thru conv2
-        dilation = 1
-        use_tconv = self.conv2_stride_options[stride_selection][0]
-        stride = self.conv2_stride_options[stride_selection][1]
-        if use_tconv:
-            output_padding = (stride[0]-1, stride[1]-1)
-            out = F.conv_transpose2d(conv1_out, self.conv2_weight.flip([2, 3]).permute(1, 0, 2, 3), stride=stride, padding=dilation, output_padding=output_padding, dilation=dilation)
-        else:
-            out = F.conv2d(conv1_out, self.conv2_weight, stride=stride, padding=dilation, dilation=dilation)
-        out = self.bn2(out)
-        out = F.relu_(out)
+        # Resize each branch to correct output resolution
+        for i in range(self.num_branches):
+            conv2_branch_outputs[i] = FeatureResize(conv2_branch_outputs[i], output_resolution)
+            # Expand feature depth back to bottleneck channels
+            conv2_branch_outputs[i] = getattr(self, "resize_"+str(i))(conv2_branch_outputs[i])
+            conv2_branch_outputs[i] = getattr(self, "bnr_"+str(i))(conv2_branch_outputs[i])
+            conv2_branch_outputs[i] = F.relu(conv2_branch_outputs[i])
+            if self.adaptive_fusion:
+                conv2_branch_outputs[i] = conv2_branch_outputs[i] * fusion_weights[i]
+
+        #print("output_resolution:", output_resolution)
+        #print("\nAfter resize:")
+        #for i in range(self.num_branches):
+        #    print(i, conv2_branch_outputs[i].shape)
+        #exit()
+
+        # Fuse branch outputs
+        out = torch.stack(conv2_branch_outputs, dim=0).sum(dim=0)
+        if not self.adaptive_fusion:
+            out /= self.num_branches
 
         # Conv3 stage
         out = self.conv3(out)
@@ -456,7 +537,7 @@ class StriderBlock(nn.Module):
         # Add residual
         if self.downsample is not None:
             identity = self.downsample(identity)
-        identity = FeatureResize(identity, out.shape[-2:])
+        identity = FeatureResize(identity, output_resolution)
         out += identity
         #out = F.relu(out) # Commenting this out because Strider with LRR connections takes care of this in Strider forward
         
@@ -477,6 +558,7 @@ class Bottleneck(nn.Module):
         stride,
         dilation,
         norm_func,
+        use_downsample=False,
         num_groups=1,
         full_residual=False,
     ):
@@ -532,7 +614,7 @@ class Bottleneck(nn.Module):
 
 
 
-    def forward(self, x):
+    def forward(self, x, dummy):
         identity = x
 
         out = self.conv1(x)
@@ -550,7 +632,7 @@ class Bottleneck(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        #out = F.relu_(out)  # Commenting this out because Strider with LRR connections takes care of this in Strider forward
+        out = F.relu_(out)
 
         return out
 

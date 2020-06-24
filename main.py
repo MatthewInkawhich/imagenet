@@ -91,11 +91,12 @@ def main():
         exit()
     with open(args.config, "r") as yamlfile:
         args.model_cfg = yaml.load(yamlfile, Loader=yaml.FullLoader)
-    args.outdir = './out/' + args.config.split('/')[-1].split('.')[0]
+    args.outdir = './out/' + args.config.split('configs/')[-1].split('.')[0]
 
     print("args.config:", args.config)
     print("args.outdir:", args.outdir)
     print("args.model_cfg:", args.model_cfg)
+
 
     if args.seed is not None:
         random.seed(args.seed)
