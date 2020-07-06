@@ -57,6 +57,7 @@ class StriderClassifier(nn.Module):
         # Assert correct config format
         assert (len(cfg['BODY_CHANNELS']) == len(cfg['BODY_CONFIG'])), "Body channels config must equal body config"
         assert (len(cfg['BODY_CHANNELS']) == len(cfg['RETURN_FEATURES'])), "Body channels config must equal return features"
+        #assert (len(cfg['BODY_CHANNELS']) == len(cfg['DOWNSAMPLE_BOUNDS'])), "Body channels config must equal downsample bounds"
 
         # Build Strider backbone
         self.body = Strider(cfg)
@@ -81,10 +82,10 @@ class StriderClassifier(nn.Module):
         self.fc = nn.Linear(out_channels, num_classes)
 
         
-    def forward(self, x):
+    def forward(self, x, epsilon):
         # Forward thru backbone
         #print("input:", x.shape)
-        x = self.body(x)
+        x = self.body(x, epsilon)
         #print("backbone out:")
         #for i in range(len(x)):
             #print("\ni:", i)
@@ -151,6 +152,7 @@ class Strider(nn.Module):
         lr_residual = cfg['LR_RESIDUAL']
         lr_adaptive_fusion = cfg['LR_ADAPTIVE_FUSION']
         fpn_adaptive_fusion = cfg['FPN_ADAPTIVE_FUSION']
+        downsample_bounds = cfg['DOWNSAMPLE_BOUNDS']
 
         for i in range(len(body_channels)):
             name = "block" + str(i)
@@ -174,11 +176,13 @@ class Strider(nn.Module):
             
             # Else, build a StriderBlock
             else:
+                downsample_bound = downsample_bounds[i]
                 block = StriderBlock(
                             in_channels=in_channels,
                             bottleneck_channels=bottleneck_channels,
                             ss_channels=ss_channels,
                             out_channels=out_channels,
+                            downsample_bound=downsample_bound,
                             norm_func=self.norm_func,
                             full_residual=full_residual,
                         )
@@ -247,8 +251,9 @@ class Strider(nn.Module):
 
 
 
-    def forward(self, x):
+    def forward(self, x, epsilon):
         #print("input:", x.shape)
+        input_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
         all_outputs = []
         outputs = []
         # Forward thru stem
@@ -256,7 +261,7 @@ class Strider(nn.Module):
         #print("stem:", x.shape, x.mean())
         for i, block_name in enumerate(self.block_names):
             # Forward thru current block
-            x = getattr(self, block_name)(x)
+            x = getattr(self, block_name)(x, epsilon, input_resolution)
             #print("block{}".format(i), x.shape)
             # Perform long range residual fusion
             for (lrr_idx, lrr_name) in self.lr_residual_dict[i]:
@@ -367,10 +372,13 @@ class StriderBlock(nn.Module):
         bottleneck_channels,
         ss_channels,
         out_channels,
+        downsample_bound,
         norm_func,
         full_residual=False,
     ):
         super(StriderBlock, self).__init__()
+
+        self.downsample_bound = downsample_bound
 
         ### Residual layer
         self.downsample = None
@@ -419,9 +427,53 @@ class StriderBlock(nn.Module):
         )
         self.bn3 = norm_func(out_channels)
 
+    
+    def select_stride(self, x, epsilon, input_resolution):
+        # Create list of valid stride options based on current resolution and input resolution
+        curr_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
+        curr_downsample = torch.ceil(input_resolution / curr_resolution)
+        print("curr_downsample:", curr_downsample)
+        all_options = list(range(len(self.conv2_stride_options)))
+        invalid_options = []
+        if curr_downsample[0] >= self.downsample_bound[0]:  # Height too small
+            invalid_options.extend([2, 3])
+        if curr_downsample[0] <= self.downsample_bound[1]:  # Height too large
+            invalid_options.extend([5, 6])
+        if curr_downsample[1] >= self.downsample_bound[0]:  # Width too small
+            invalid_options.extend([1, 3])
+        if curr_downsample[1] <= self.downsample_bound[1]:  # Width too large
+            invalid_options.extend([4, 6])
+        valid_options = [i for i in all_options if i not in invalid_options]
+        print("valid_options:", valid_options)
+
+        # Forward pass features thru SS module
+        ss_out = self.ss(x)
+
+        # Select stride using batch majority vote w/ epsilon greedy exploration
+        sample = random.random()
+        if sample > epsilon:
+            ss_sum = torch.sum(ss_out, dim=0)
+            print("ss_sum:", ss_sum, ss_sum.shape)
+            sorted_stride_options = torch.argsort(ss_sum)
+            print("sorted_stride_options:", sorted_stride_options, sorted_stride_options.shape)
+            for opt in sorted_stride_options:
+                opt = opt.item()
+                if opt in valid_options:
+                    ss_choice = opt 
+                    break
+        else:
+            print("random!")
+            ss_choice = random.choice(valid_options)
+
+        # Gather loss preds based on selected stride option
+        print("ss_choice:", ss_choice)
+        ss_preds = ss_out[:, ss_choice].unsqueeze_(1)
+        print("ss_preds:", ss_preds, ss_preds.shape)
+
+        return ss_choice, ss_preds
 
 
-    def forward(self, x, epsilon):
+    def forward(self, x, epsilon, input_resolution):
         # Store copy of input feature
         identity = x
 
@@ -430,17 +482,14 @@ class StriderBlock(nn.Module):
         out = self.bn1(out)
         conv1_out = F.relu(out)
     
-        # Forward thru Stride Selector Module
-        stride_selection = 0
-        ss_out = self.ss(conv1_out)
-
-
-
+        # Select stride for conv2
+        #ss_choice = 0
+        ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution)
 
         # Forward thru conv2
         dilation = 1
-        use_tconv = self.conv2_stride_options[stride_selection][0]
-        stride = self.conv2_stride_options[stride_selection][1]
+        use_tconv = self.conv2_stride_options[ss_choice][0]
+        stride = self.conv2_stride_options[ss_choice][1]
         if use_tconv:
             output_padding = (stride[0]-1, stride[1]-1)
             out = F.conv_transpose2d(conv1_out, self.conv2_weight.flip([2, 3]).permute(1, 0, 2, 3), stride=stride, padding=dilation, output_padding=output_padding, dilation=dilation)
@@ -532,7 +581,7 @@ class Bottleneck(nn.Module):
 
 
 
-    def forward(self, x):
+    def forward(self, x, dummy1, dummy2):
         identity = x
 
         out = self.conv1(x)
