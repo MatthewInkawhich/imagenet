@@ -39,13 +39,16 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
-# Epsilon-greedy configs
+# New adaptive configs
 parser.add_argument('--eps-start', default=1.0, type=float, metavar='N',
                     help='starting epsilon value')
 parser.add_argument('--eps-end', default=0.05, type=float, metavar='N',
                     help='ending epsilon value')
 parser.add_argument('--eps-iters', default=30, type=int, metavar='N',
                     help='number of iterations until epsilon decays to eps-end')
+parser.add_argument('--stage1-loss-queue-length', default=30, type=int, metavar='N',
+                    help='length of the loss queue that is used to compute curr_avg_loss from stage1')
+
 
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -208,8 +211,9 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    # define loss functions (criterions) for both training stages and optimizer
+    criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion2 = nn.SmoothL1Loss().cuda(args.gpu)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -290,9 +294,13 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
-        # train for one epoch
+        # update current epoch's epsilon
         epsilon = eps_schedule[epoch].item()
-        train(train_loader, model, criterion, optimizer, epoch, epsilon, args)
+        # train STAGE1 for one epoch
+        #stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer, epoch, epsilon, args)
+        stage1_avg_loss = 0
+        # train STAGE2 for one epoch
+        train_stage2(train_loader, model, criterion2, optimizer, epoch, epsilon, stage1_avg_loss, args)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
@@ -312,7 +320,10 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, outdir=args.outdir, filename='checkpoint.pth.tar')
 
 
-def train(train_loader, model, criterion, optimizer, epoch, epsilon, args):
+# One full epoch of training on task (stage 1)
+# Returns average training task loss from last args.stage1_loss_queue_length
+def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args):
+    print("Starting Stage 1, Epoch:", epoch)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -325,9 +336,14 @@ def train(train_loader, model, criterion, optimizer, epoch, epsilon, args):
 
     # switch to train mode
     model.train()
-
     end = time.time()
+
+    # Create loss queue
+    loss_queue = []
     for i, (images, target) in enumerate(train_loader):
+        print("images:", images.shape)
+        print("target:", target, target.shape)
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -336,8 +352,80 @@ def train(train_loader, model, criterion, optimizer, epoch, epsilon, args):
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(images, epsilon)
+        output, preds, choices = model(images, epsilon, 1)
         loss = criterion(output, target)
+
+        print("output:", output.shape)
+        print("preds:", preds)
+        print("choices:", choices)
+        print("loss:", loss, loss.shape)
+        exit()
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # Add loss to loss queue
+        loss_queue.append(loss.item())
+        if len(loss_queue) > args.stage1_loss_queue_length:
+            loss_queue.pop(0)
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+
+        loss_queue_avg = sum(loss_queue) / len(loss_queue)
+        return loss_queue_avg
+
+
+# One full epoch of training SS modules (stage 2)
+def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stage1_avg_loss, args):
+    print("Starting Stage 2, Epoch:", epoch)
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
+    # switch to train mode
+    model.train()
+    end = time.time()
+
+    for i, (images, target) in enumerate(train_loader):
+        print("images:", images.shape)
+        print("target:", target, target.shape)
+
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
+
+        # compute output
+        output, preds, choices = model(images, epsilon, 2)
+        with torch.no_grad():
+            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+
+        print("output:", output.shape)
+        print("preds:", preds)
+        print("choices:", choices)
+        print("task loss:", task_loss, task_loss.shape)
+        exit()
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -356,7 +444,6 @@ def train(train_loader, model, criterion, optimizer, epoch, epsilon, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
-
 
 
 def validate(val_loader, model, criterion, args):
@@ -380,7 +467,7 @@ def validate(val_loader, model, criterion, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(images, 0)
+            output, preds, choices = model(images, -1)
             loss = criterion(output, target)
 
             # measure accuracy and record loss

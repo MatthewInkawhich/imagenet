@@ -82,46 +82,49 @@ class StriderClassifier(nn.Module):
         self.fc = nn.Linear(out_channels, num_classes)
 
         
-    def forward(self, x, epsilon):
+    def forward(self, x, epsilon, stage):
         # Forward thru backbone
         #print("input:", x.shape)
-        x = self.body(x, epsilon)
+        x, preds, choices = self.body(x, epsilon, stage)
         #print("backbone out:")
         #for i in range(len(x)):
             #print("\ni:", i)
             #print("shape:", x[i].shape)
             #print("mean activation:", x[i].mean())
 
-        # Forward thru FPN
-        if self.use_fpn:
-            x = self.fpn(x)
 
-            #print("fpn out:")
-            #for i in range(len(x)):
-            #    print("\ni:", i)
-            #    print("shape:", x[i].shape)
-            #    print("mean activation:", x[i].mean())
+        # If stage==2 do NOT compute gradients
+        with torch.set_grad_enabled(stage == 1):
+            # Forward thru FPN
+            if self.use_fpn:
+                x = self.fpn(x)
 
-            # Merge FPN outputs
-            out = x[0]
-            for i in range(1, len(x)):
-                out = out + F.interpolate(x[i], size=out.shape[-2:], mode='nearest')
-            out = out / len(x)
-        else:
-            if len(x) > 1:
-                print("Error: Length of backbone output > 1, but no FPN is used. Check RETURN_FEATURES config...")
-                exit()
-            out = x[0]
+                #print("fpn out:")
+                #for i in range(len(x)):
+                #    print("\ni:", i)
+                #    print("shape:", x[i].shape)
+                #    print("mean activation:", x[i].mean())
 
-        #print("out:", out.shape, out.mean())
-        #exit()
+                # Merge FPN outputs
+                out = x[0]
+                for i in range(1, len(x)):
+                    out = out + F.interpolate(x[i], size=out.shape[-2:], mode='nearest')
+                out = out / len(x)
+            else:
+                if len(x) > 1:
+                    print("Error: Length of backbone output > 1, but no FPN is used. Check RETURN_FEATURES config...")
+                    exit()
+                out = x[0]
 
-        # Forward thru classification head
-        out = self.avgpool(out)
-        out = torch.flatten(out, 1)
-        out = self.fc(out)
+            #print("out:", out.shape, out.mean())
+            #exit()
 
-        return out
+            # Forward thru classification head
+            out = self.avgpool(out)
+            out = torch.flatten(out, 1)
+            out = self.fc(out)
+
+        return out, preds, choices
 
 
 
@@ -251,37 +254,50 @@ class Strider(nn.Module):
 
 
 
-    def forward(self, x, epsilon):
+    def forward(self, x, epsilon, stage):
         #print("input:", x.shape)
         input_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
+        all_preds = []
+        all_choices = []
         all_outputs = []
         outputs = []
         # Forward thru stem
-        x = self.stem(x)
+        with torch.set_grad_enabled(stage==1):
+            x = self.stem(x)
         #print("stem:", x.shape, x.mean())
         for i, block_name in enumerate(self.block_names):
             # Forward thru current block
-            x = getattr(self, block_name)(x, epsilon, input_resolution)
+            if isinstance(getattr(self, block_name), StriderBlock):
+                # If it is a StriderBlock pass the extra args and get extra return values
+                x, preds, choices = getattr(self, block_name)(x, epsilon, input_resolution, stage)
+                all_preds.append(preds)
+                all_choices.append(choices)
+            else:
+                # If it is NOT a StriderBlock, forward as usual
+                with torch.set_grad_enabled(stage==1):
+                    x = getattr(self, block_name)(x)
+
             #print("block{}".format(i), x.shape)
             # Perform long range residual fusion
-            for (lrr_idx, lrr_name) in self.lr_residual_dict[i]:
-                lrr_feat = all_outputs[lrr_idx]
-                # First, process the lrr feature
-                lrr_feat = FeatureResize(lrr_feat, x.shape[-2:])
-                if lrr_name:
-                    lrr_feat = getattr(self, lrr_name)(lrr_feat)
-                # Next, add the lrr_feat to x
-                x += lrr_feat
-            # Normalize the fusion; only perform if fusion was done
-            if self.lr_residual_dict[i]:
-                x /= len(self.lr_residual_dict[i])
-            # Perform nonlinearity AFTER fusion
-            x = F.relu(x)
+            with torch.set_grad_enabled(stage==1):
+                for (lrr_idx, lrr_name) in self.lr_residual_dict[i]:
+                    lrr_feat = all_outputs[lrr_idx]
+                    # First, process the lrr feature
+                    lrr_feat = FeatureResize(lrr_feat, x.shape[-2:])
+                    if lrr_name:
+                        lrr_feat = getattr(self, lrr_name)(lrr_feat)
+                    # Next, add the lrr_feat to x
+                    x += lrr_feat
+                # Normalize the fusion; only perform if fusion was done
+                if self.lr_residual_dict[i]:
+                    x /= len(self.lr_residual_dict[i])
+                # Perform nonlinearity AFTER fusion
+                x = F.relu(x)
 
-            all_outputs.append(x)
-            if self.return_features[block_name]:
-                #print("Adding to return list")
-                outputs.append(x)
+                all_outputs.append(x)
+                if self.return_features[block_name]:
+                    #print("Adding to return list")
+                    outputs.append(x)
         
         
         #for i in range(len(outputs)):
@@ -291,7 +307,7 @@ class Strider(nn.Module):
         #    print("frac of nonzero activations:", (outputs[i] != 0).sum().float() / outputs[i].numel())
         #exit()
 
-        return outputs
+        return outputs, all_preds, all_choices
 
 
 
@@ -432,7 +448,7 @@ class StriderBlock(nn.Module):
         # Create list of valid stride options based on current resolution and input resolution
         curr_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
         curr_downsample = torch.ceil(input_resolution / curr_resolution)
-        print("curr_downsample:", curr_downsample)
+        #print("curr_downsample:", curr_downsample)
         all_options = list(range(len(self.conv2_stride_options)))
         invalid_options = []
         if curr_downsample[0] >= self.downsample_bound[0]:  # Height too small
@@ -444,7 +460,7 @@ class StriderBlock(nn.Module):
         if curr_downsample[1] <= self.downsample_bound[1]:  # Width too large
             invalid_options.extend([4, 6])
         valid_options = [i for i in all_options if i not in invalid_options]
-        print("valid_options:", valid_options)
+        #print("valid_options:", valid_options)
 
         # Forward pass features thru SS module
         ss_out = self.ss(x)
@@ -453,63 +469,65 @@ class StriderBlock(nn.Module):
         sample = random.random()
         if sample > epsilon:
             ss_sum = torch.sum(ss_out, dim=0)
-            print("ss_sum:", ss_sum, ss_sum.shape)
+            #print("ss_sum:", ss_sum, ss_sum.shape)
             sorted_stride_options = torch.argsort(ss_sum)
-            print("sorted_stride_options:", sorted_stride_options, sorted_stride_options.shape)
+            #print("sorted_stride_options:", sorted_stride_options, sorted_stride_options.shape)
             for opt in sorted_stride_options:
                 opt = opt.item()
                 if opt in valid_options:
                     ss_choice = opt 
                     break
         else:
-            print("random!")
+            #print("random!")
             ss_choice = random.choice(valid_options)
 
         # Gather loss preds based on selected stride option
-        print("ss_choice:", ss_choice)
-        ss_preds = ss_out[:, ss_choice].unsqueeze_(1)
-        print("ss_preds:", ss_preds, ss_preds.shape)
+        #print("ss_choice:", ss_choice)
+        ss_preds = ss_out[:, ss_choice]
+        #print("ss_preds:", ss_preds, ss_preds.shape)
 
         return ss_choice, ss_preds
 
 
-    def forward(self, x, epsilon, input_resolution):
-        # Store copy of input feature
-        identity = x
+    def forward(self, x, epsilon, input_resolution, stage):
+        with torch.set_grad_enabled(stage==1):
+            # Store copy of input feature
+            identity = x
 
-        # Forward thru conv1
-        out = self.conv1(x)
-        out = self.bn1(out)
-        conv1_out = F.relu(out)
+            # Forward thru conv1
+            out = self.conv1(x)
+            out = self.bn1(out)
+            conv1_out = F.relu(out)
     
         # Select stride for conv2
-        #ss_choice = 0
-        ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution)
+        with torch.set_grad_enabled(stage==2):
+            ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution)
 
         # Forward thru conv2
-        dilation = 1
-        use_tconv = self.conv2_stride_options[ss_choice][0]
-        stride = self.conv2_stride_options[ss_choice][1]
-        if use_tconv:
-            output_padding = (stride[0]-1, stride[1]-1)
-            out = F.conv_transpose2d(conv1_out, self.conv2_weight.flip([2, 3]).permute(1, 0, 2, 3), stride=stride, padding=dilation, output_padding=output_padding, dilation=dilation)
-        else:
-            out = F.conv2d(conv1_out, self.conv2_weight, stride=stride, padding=dilation, dilation=dilation)
-        out = self.bn2(out)
-        out = F.relu_(out)
+        with torch.set_grad_enabled(stage==1):
+            dilation = 1
+            use_tconv = self.conv2_stride_options[ss_choice][0]
+            stride = self.conv2_stride_options[ss_choice][1]
+            if use_tconv:
+                output_padding = (stride[0]-1, stride[1]-1)
+                out = F.conv_transpose2d(conv1_out, self.conv2_weight.flip([2, 3]).permute(1, 0, 2, 3), stride=stride, padding=dilation, output_padding=output_padding, dilation=dilation)
+            else:
+                out = F.conv2d(conv1_out, self.conv2_weight, stride=stride, padding=dilation, dilation=dilation)
+            out = self.bn2(out)
+            out = F.relu_(out)
 
-        # Conv3 stage
-        out = self.conv3(out)
-        out = self.bn3(out)
+            # Conv3 stage
+            out = self.conv3(out)
+            out = self.bn3(out)
 
-        # Add residual
-        if self.downsample is not None:
-            identity = self.downsample(identity)
-        identity = FeatureResize(identity, out.shape[-2:])
-        out += identity
-        #out = F.relu(out) # Commenting this out because Strider with LRR connections takes care of this in Strider forward
+            # Add residual
+            if self.downsample is not None:
+                identity = self.downsample(identity)
+            identity = FeatureResize(identity, out.shape[-2:])
+            out += identity
+            #out = F.relu(out) # Commenting this out because Strider with LRR connections takes care of this in Strider forward
         
-        return out
+        return out, ss_preds, ss_choice
 
 
 
@@ -581,7 +599,7 @@ class Bottleneck(nn.Module):
 
 
 
-    def forward(self, x, dummy1, dummy2):
+    def forward(self, x):
         identity = x
 
         out = self.conv1(x)
