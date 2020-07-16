@@ -44,11 +44,10 @@ parser.add_argument('--eps-start', default=1.0, type=float, metavar='N',
                     help='starting epsilon value')
 parser.add_argument('--eps-end', default=0.05, type=float, metavar='N',
                     help='ending epsilon value')
-parser.add_argument('--eps-iters', default=30, type=int, metavar='N',
+parser.add_argument('--eps-iters', default=40, type=int, metavar='N',
                     help='number of iterations until epsilon decays to eps-end')
 parser.add_argument('--stage1-loss-queue-length', default=30, type=int, metavar='N',
                     help='length of the loss queue that is used to compute curr_avg_loss from stage1')
-
 
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -214,7 +213,6 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss functions (criterions) for both training stages and optimizer
     criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
     criterion2 = nn.SmoothL1Loss().cuda(args.gpu)
-
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -244,8 +242,8 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    #traindir = '/zero1/data1/ILSVRC2012/train/original'
-    traindir = './data/ILSVRC2012_val' 
+    traindir = '/zero1/data1/ILSVRC2012/train/original'
+    #traindir = './data/ILSVRC2012_val' 
     valdir = './data/ILSVRC2012_val' 
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -280,13 +278,16 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion1, args)
         return
 
     # Create epsilon greedy decay schedule
-    eps_linspace = torch.linspace(args.eps_start, args.eps_end, steps=args.eps_iters)
-    eps_schedule = torch.full([args.epochs], args.eps_end)
-    eps_schedule[:eps_linspace.shape[0]] = eps_linspace
+    if args.model_cfg['STRIDER']['RANDOM_STRIDE']:
+        eps_schedule = torch.full([args.epochs], 100.0)
+    else:
+        eps_linspace = torch.linspace(args.eps_start, args.eps_end, steps=args.eps_iters)
+        eps_schedule = torch.full([args.epochs], args.eps_end)
+        eps_schedule[:eps_linspace.shape[0]] = eps_linspace
     print("eps_schedule:", eps_schedule, eps_schedule.shape)
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -297,13 +298,13 @@ def main_worker(gpu, ngpus_per_node, args):
         # update current epoch's epsilon
         epsilon = eps_schedule[epoch].item()
         # train STAGE1 for one epoch
-        #stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer, epoch, epsilon, args)
-        stage1_avg_loss = 0
+        stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer, epoch, epsilon, args)
         # train STAGE2 for one epoch
+        print("stage1_avg_loss:", stage1_avg_loss)
         train_stage2(train_loader, model, criterion2, optimizer, epoch, epsilon, stage1_avg_loss, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion1, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -332,7 +333,7 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}]".format(epoch))
+        prefix="Epoch: [{}] S1".format(epoch))
 
     # switch to train mode
     model.train()
@@ -340,10 +341,9 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
 
     # Create loss queue
     loss_queue = []
-    for i, (images, target) in enumerate(train_loader):
-        print("images:", images.shape)
-        print("target:", target, target.shape)
 
+    # Iterate over training images
+    for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -352,14 +352,14 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output, preds, choices = model(images, epsilon, 1)
+        output, preds, choices = model(images, epsilon, 1, device='cuda')
         loss = criterion(output, target)
 
-        print("output:", output.shape)
-        print("preds:", preds)
-        print("choices:", choices)
-        print("loss:", loss, loss.shape)
-        exit()
+        #print("output:", output.shape)
+        #print("preds:", preds, preds.shape)
+        #print("choices:", choices, choices.shape)
+        #print("loss:", loss, loss.shape)
+        #exit()
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -375,6 +375,12 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        #for n, p in model.named_parameters():
+        #    if p.grad is None or p.grad.abs().sum() == 0:
+        #        print(n, "NO/ZERO GRAD")
+        #    else:
+        #        print(n, p.grad.shape)
+        #exit()
         optimizer.step()
 
         # measure elapsed time
@@ -384,8 +390,16 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
         if i % args.print_freq == 0:
             progress.display(i)
 
-        loss_queue_avg = sum(loss_queue) / len(loss_queue)
-        return loss_queue_avg
+        # Empty cache (prevent memory creep)
+        #torch.cuda.empty_cache()
+        #print("memory for tensors:", torch.cuda.memory_allocated())
+        #print("memory for cache:", torch.cuda.memory_cached() / 1e9)
+
+
+    # After all iterations, compute average of last N losses
+    loss_queue_avg = sum(loss_queue) / len(loss_queue)
+    return loss_queue_avg
+
 
 
 # One full epoch of training SS modules (stage 2)
@@ -399,16 +413,14 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}]".format(epoch))
+        prefix="Epoch: [{}] S2".format(epoch))
 
     # switch to train mode
     model.train()
     end = time.time()
 
+    # Iterate over training samples
     for i, (images, target) in enumerate(train_loader):
-        print("images:", images.shape)
-        print("target:", target, target.shape)
-
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -416,26 +428,42 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
             images = images.cuda(args.gpu, non_blocking=True)
         target = target.cuda(args.gpu, non_blocking=True)
 
-        # compute output
-        output, preds, choices = model(images, epsilon, 2)
-        with torch.no_grad():
-            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+        # Forward batch thru model
+        output, ss_output, choices = model(images, epsilon, 2, device='cuda')
 
-        print("output:", output.shape)
-        print("preds:", preds)
-        print("choices:", choices)
-        print("task loss:", task_loss, task_loss.shape)
-        exit()
+        with torch.no_grad():
+            # Compute task loss
+            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+            # Compute ss_target
+            ss_target = (task_loss.detach() - stage1_avg_loss) / stage1_avg_loss
+            ss_target = torch.repeat_interleave(ss_target.unsqueeze(1), ss_output.shape[1], dim=1)
+            # Note that the ss_output and ss_target should be of shape: [N, #adaptive blocks]
+
+        # Compute SS loss
+        ss_loss = criterion(ss_output, ss_target)
+
+        #print("output:", output.shape)
+        #print("choices:", choices, choices.shape)
+        #print("task loss:", task_loss, task_loss.shape)
+        #print("ss_output:", ss_output, ss_output.shape, ss_output.dtype)
+        #print("ss_target:", ss_target, ss_target.shape, ss_target.dtype)
+        #print("ss_loss:", ss_loss, ss_loss.shape)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
+        losses.update(ss_loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        ss_loss.backward()
+        #for n, p in model.named_parameters():
+        #    if p.grad is None or p.grad.abs().sum() == 0:
+        #        print(n, "NO/ZERO GRAD")
+        #    else:
+        #        print(n, p.grad.shape)
+        #exit()
         optimizer.step()
 
         # measure elapsed time
@@ -444,6 +472,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
 
         if i % args.print_freq == 0:
             progress.display(i)
+
 
 
 def validate(val_loader, model, criterion, args):
@@ -456,6 +485,11 @@ def validate(val_loader, model, criterion, args):
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
+    # Initialize counts tensor
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_stride_options = 7  # Hardcode this for now
+    ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
+
     # switch to evaluate mode
     model.eval()
 
@@ -467,8 +501,14 @@ def validate(val_loader, model, criterion, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output, preds, choices = model(images, -1)
+            # set epsilon to -1 so it is pure greedy selection and use stage 2 forward (doesn't matter)
+            output, preds, choices = model(images, -1, 2, device='cuda')
             loss = criterion(output, target)
+
+            # Track choice counts per SS block
+            for ss_id in range(choices.shape[1]):
+                for j in range(choices.shape[0]):
+                    ss_choice_counts[ss_id][choices[j][ss_id]] += 1
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -486,6 +526,10 @@ def validate(val_loader, model, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+
+        print("SS Choice Counts:")
+        for i in range(ss_choice_counts.shape[0]):
+            print("SS Block:", i, ss_choice_counts[i])
 
     return top1.avg
 
