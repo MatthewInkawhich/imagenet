@@ -126,7 +126,6 @@ class StriderClassifier(nn.Module):
 
 
 
-
 ################################################################################
 ### Strider Backbone Module
 ################################################################################
@@ -278,22 +277,6 @@ class Strider(nn.Module):
                 # If it is NOT a StriderBlock, forward as usual
                 with torch.set_grad_enabled(stage==1):
                     x = getattr(self, block_name)(x)
-
-            #print("block{}".format(i), x.shape)
-            if i <= 6:
-                if x.shape[2] > 56 or x.shape[3] > 56:
-                    print("OUT OF BOUNDS:", i, x.shape)
-                    exit()
-                if x.shape[2] < 4 or x.shape[3] < 4:
-                    print("OUT OF BOUNDS:", i, x.shape)
-                    exit()
-            if i > 6:
-                if x.shape[2] > 28 or x.shape[3] > 28:
-                    print("OUT OF BOUNDS:", i, x.shape)
-                    exit()
-                if x.shape[2] < 4 or x.shape[3] < 4:
-                    print("OUT OF BOUNDS:", i, x.shape)
-                    exit()
 
             # Perform long range residual fusion
             with torch.set_grad_enabled(stage==1):
@@ -481,9 +464,9 @@ class StriderBlock(nn.Module):
             invalid_options.extend([4, 6])
         if curr_downsample[0] > self.downsample_bound[0]:      # Height too small to keep current resolution
             invalid_options.extend([0, 1, 4])
-        if curr_downsample[1] > self.downsample_bound[1]:      # Width too small to keep current resolution
+        if curr_downsample[1] > self.downsample_bound[0]:      # Width too small to keep current resolution
             invalid_options.extend([0, 2, 5])
-        if curr_downsample[0] < self.downsample_bound[0]:      # Height too large to keep current resolution
+        if curr_downsample[0] < self.downsample_bound[1]:      # Height too large to keep current resolution
             invalid_options.extend([0, 1, 4])
         if curr_downsample[1] < self.downsample_bound[1]:      # Width too large to keep current resolution
             invalid_options.extend([0, 2, 5])
@@ -515,6 +498,7 @@ class StriderBlock(nn.Module):
         #print("curr_downsample:", curr_downsample)
         #print("invalid_options:", invalid_options)
         #print("ss_choice:", ss_choice)
+        #print("ss_out:", ss_out)
 
         # Gather loss preds based on selected stride option
         ss_preds = ss_out[:, ss_choice].unsqueeze(1)
@@ -542,7 +526,7 @@ class StriderBlock(nn.Module):
         with torch.set_grad_enabled(stage==1):
             dilation = 1
             use_tconv = self.conv2_stride_options[ss_choice.item()][0]
-            stride = self.conv2_stride_options[ss_choice.item()][1]
+            stride = tuple(self.conv2_stride_options[ss_choice.item()][1])
 
             if use_tconv:
                 output_padding = (stride[0]-1, stride[1]-1)

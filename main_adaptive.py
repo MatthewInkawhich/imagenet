@@ -40,17 +40,26 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 # New adaptive configs
+parser.add_argument('--start-cycle', default=0, type=int, metavar='N',
+                    help='manual cycle number (useful on restarts)')
+parser.add_argument('--cycles', default=1, type=int, metavar='N',
+                    help='number of s1 s2 cycles')
+parser.add_argument('--stage1-epochs-per-cycle', default=90, type=int, metavar='N',
+                    help='number of stage1 epochs per cycle')
+parser.add_argument('--stage2-epochs-per-cycle', default=45, type=int, metavar='N',
+                    help='number of stage2 epochs per cycle')
 parser.add_argument('--eps-start', default=1.0, type=float, metavar='N',
                     help='starting epsilon value')
 parser.add_argument('--eps-end', default=0.05, type=float, metavar='N',
                     help='ending epsilon value')
-parser.add_argument('--eps-iters', default=40, type=int, metavar='N',
-                    help='number of iterations until epsilon decays to eps-end')
-parser.add_argument('--stage1-loss-queue-length', default=30, type=int, metavar='N',
+parser.add_argument('--eps-decay-factor', default=0.75, type=float, metavar='N',
+                    help='percentage of total epochs until epsilon decays to eps-end')
+parser.add_argument('--stage1-loss-queue-length', default=50, type=int, metavar='N',
                     help='length of the loss queue that is used to compute curr_avg_loss from stage1')
+parser.add_argument('--evaluate-freq', default=10, type=int, metavar='N',
+                    help='frequency to evaluate and save (epochs)')
 
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
+
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
@@ -210,10 +219,14 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
+
     # define loss functions (criterions) for both training stages and optimizer
     criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
     criterion2 = nn.SmoothL1Loss().cuda(args.gpu)
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    optimizer1 = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+    optimizer2 = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -233,13 +246,19 @@ def main_worker(gpu, ngpus_per_node, args):
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            optimizer1.load_state_dict(checkpoint['optimizer1'])
+            optimizer2.load_state_dict(checkpoint['optimizer2'])
+            print("=> loaded checkpoint '{}' (cycle {})"
+                  .format(args.resume, checkpoint['cycle']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
+
+    # Enable benchmark mode
     cudnn.benchmark = True
+
+    device_count = torch.cuda.device_count()
+    print("device_count:", device_count)
 
     # Data loading code
     traindir = '/zero1/data1/ILSVRC2012/train/original'
@@ -274,56 +293,74 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ])),
-        batch_size=args.batch_size, shuffle=False,
+        batch_size=device_count, shuffle=False,  # batch size for each device should be 1
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
+        print("EVALUATE flag set, evaluating model now...")
         validate(val_loader, model, criterion1, args)
         return
 
     # Create epsilon greedy decay schedule
+    stage1_total_epochs = args.cycles * args.stage1_epochs_per_cycle
+    stage2_total_epochs = args.cycles * args.stage2_epochs_per_cycle
     if args.model_cfg['STRIDER']['RANDOM_STRIDE']:
-        eps_schedule = torch.full([args.epochs], 100.0)
+        eps_schedule1 = torch.full([stage1_total_epochs], 100.0)
+        eps_schedule2 = torch.full([stage2_total_epochs], 100.0)
     else:
-        eps_linspace = torch.linspace(args.eps_start, args.eps_end, steps=args.eps_iters)
-        eps_schedule = torch.full([args.epochs], args.eps_end)
-        eps_schedule[:eps_linspace.shape[0]] = eps_linspace
-    print("eps_schedule:", eps_schedule, eps_schedule.shape)
+        # Set epsilons for stage1
+        eps_linspace = torch.linspace(args.eps_start, args.eps_end, int(stage1_total_epochs * args.eps_decay_factor))
+        eps_schedule1 = torch.full([stage1_total_epochs], args.eps_end)
+        eps_schedule1[:eps_linspace.shape[0]] = eps_linspace
+        # Set epsilons for stage2
+        eps_linspace = torch.linspace(args.eps_start, args.eps_end, int(stage2_total_epochs * args.eps_decay_factor))
+        eps_schedule2 = torch.full([stage2_total_epochs], args.eps_end)
+        eps_schedule2[:eps_linspace.shape[0]] = eps_linspace
+    print("eps_schedule1:", eps_schedule1, eps_schedule1.shape)
+    print("eps_schedule2:", eps_schedule2, eps_schedule2.shape)
 
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
 
-        # update current epoch's epsilon
-        epsilon = eps_schedule[epoch].item()
-        # train STAGE1 for one epoch
-        stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer, epoch, epsilon, args)
-        # train STAGE2 for one epoch
-        print("stage1_avg_loss:", stage1_avg_loss)
-        train_stage2(train_loader, model, criterion2, optimizer, epoch, epsilon, stage1_avg_loss, args)
 
-        # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion1, args)
+    ##############
+    # EPOCH LOOP
+    ##############
+    for c in range(args.start_cycle, args.cycles):
+        print("Starting cycle:", c)
+        for epoch in range(args.stage1_epochs_per_cycle):
+            # Compute total stage1 epoch
+            total_epoch = epoch + (c * args.stage1_epochs_per_cycle)
+            # Update learning rate
+            adjust_learning_rate(optimizer1, total_epoch, args)
+            # Update current epoch's epsilon
+            epsilon = eps_schedule1[total_epoch].item()
+            # Train STAGE1 for one epoch
+            stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
+            # Evaluate if necessary
+            if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
 
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        for epoch in range(args.stage2_epochs_per_cycle):
+            # Compute total stage1 epoch
+            total_epoch = epoch + (c * args.stage2_epochs_per_cycle)
+            # Update learning rate
+            adjust_learning_rate(optimizer2, total_epoch, args)
+            # Update current epoch's epsilon
+            epsilon = eps_schedule2[total_epoch].item()
+            # Train STAGE2 for one epoch
+            train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, stage1_avg_loss, args)
+            # Evaluate if necessary
+            if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': model_name,
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-            }, is_best, outdir=args.outdir, filename='checkpoint.pth.tar')
+    # Evaluate when all cycles are done
+    print("Final Evaluation:")
+    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
+
 
 
 # One full epoch of training on task (stage 1)
 # Returns average training task loss from last args.stage1_loss_queue_length
-def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args):
+def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, args):
     print("Starting Stage 1, Epoch:", epoch)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -333,7 +370,12 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}] S1".format(epoch))
+        prefix="Epoch: [{}] [{}] S1".format(epoch, total_epoch))
+
+    # Initialize counts tensor
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_stride_options = 7  # Hardcode this for now
+    ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # switch to train mode
     model.train()
@@ -354,6 +396,11 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
         # compute output
         output, preds, choices = model(images, epsilon, 1, device='cuda')
         loss = criterion(output, target)
+
+        # Track choice counts per SS block
+        for ss_id in range(choices.shape[1]):
+            for j in range(choices.shape[0]):
+                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
 
         #print("output:", output.shape)
         #print("preds:", preds, preds.shape)
@@ -390,11 +437,10 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
         if i % args.print_freq == 0:
             progress.display(i)
 
-        # Empty cache (prevent memory creep)
-        #torch.cuda.empty_cache()
-        #print("memory for tensors:", torch.cuda.memory_allocated())
-        #print("memory for cache:", torch.cuda.memory_cached() / 1e9)
-
+    # Print SS choice counts
+    print("SS Choice Counts:")
+    for i in range(ss_choice_counts.shape[0]):
+        print("SS Block:", i, ss_choice_counts[i])
 
     # After all iterations, compute average of last N losses
     loss_queue_avg = sum(loss_queue) / len(loss_queue)
@@ -403,7 +449,7 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, epsilon, args
 
 
 # One full epoch of training SS modules (stage 2)
-def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stage1_avg_loss, args):
+def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, stage1_avg_loss, args):
     print("Starting Stage 2, Epoch:", epoch)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -413,7 +459,12 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}] S2".format(epoch))
+        prefix="Epoch: [{}] [{}] S2".format(epoch, total_epoch))
+
+    # Initialize counts tensor
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_stride_options = 7  # Hardcode this for now
+    ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # switch to train mode
     model.train()
@@ -442,9 +493,14 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
         # Compute SS loss
         ss_loss = criterion(ss_output, ss_target)
 
-        #print("output:", output.shape)
-        #print("choices:", choices, choices.shape)
+        # Track choice counts per SS block
+        for ss_id in range(choices.shape[1]):
+            for j in range(choices.shape[0]):
+                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
+
+        #print("\noutput:", output.shape)
         #print("task loss:", task_loss, task_loss.shape)
+        #print("choices:", choices, choices.shape)
         #print("ss_output:", ss_output, ss_output.shape, ss_output.dtype)
         #print("ss_target:", ss_target, ss_target.shape, ss_target.dtype)
         #print("ss_loss:", ss_loss, ss_loss.shape)
@@ -472,6 +528,11 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, epsilon, stag
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+    # Print SS choice counts
+    print("SS Choice Counts:")
+    for i in range(ss_choice_counts.shape[0]):
+        print("SS Block:", i, ss_choice_counts[i])
 
 
 
@@ -527,11 +588,35 @@ def validate(val_loader, model, criterion, args):
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
+        # Print SS choice counts
         print("SS Choice Counts:")
         for i in range(ss_choice_counts.shape[0]):
             print("SS Block:", i, ss_choice_counts[i])
 
     return top1.avg
+
+
+
+def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args):
+    # Evaluate on validation set
+    acc1 = validate(val_loader, model, criterion1, args)
+
+    # remember best acc@1 and save checkpoint
+    is_best = acc1 > best_acc1
+    best_acc1 = max(acc1, best_acc1)
+
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+            and args.rank % ngpus_per_node == 0):
+        save_checkpoint({
+            'cycle': cycle + 1,
+            'arch': model_name,
+            'state_dict': model.state_dict(),
+            'best_acc1': best_acc1,
+            'optimizer1' : optimizer1.state_dict(),
+            'optimizer2' : optimizer2.state_dict(),
+            'stage1_avg_loss' : stage1_avg_loss,
+        }, is_best, outdir=args.outdir, filename='checkpoint.pth.tar')
+
 
 
 def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pth.tar'):
@@ -542,6 +627,7 @@ def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pt
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(outdir, 'model_best.pth.tar'))
+
 
 
 class AverageMeter(object):
