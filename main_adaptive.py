@@ -240,7 +240,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
+            args.start_cycle = checkpoint['cycle']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
@@ -337,7 +337,7 @@ def main_worker(gpu, ngpus_per_node, args):
             stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
 
         for epoch in range(args.stage2_epochs_per_cycle):
             # Compute total stage1 epoch
@@ -350,11 +350,11 @@ def main_worker(gpu, ngpus_per_node, args):
             train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, stage1_avg_loss, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
 
     # Evaluate when all cycles are done
     print("Final Evaluation:")
-    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args)
+    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
 
 
 
@@ -436,6 +436,7 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
         if i % args.print_freq == 0:
             progress.display(i)
+
 
     # Print SS choice counts
     print("SS Choice Counts:")
@@ -537,6 +538,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
 
 def validate(val_loader, model, criterion, args):
+    print("Running evaluation...")
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -597,7 +599,8 @@ def validate(val_loader, model, criterion, args):
 
 
 
-def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, stage1_avg_loss, args):
+def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, model_name, stage1_avg_loss, args):
+    global best_acc1
     # Evaluate on validation set
     acc1 = validate(val_loader, model, criterion1, args)
 
