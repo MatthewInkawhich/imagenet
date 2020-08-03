@@ -5,6 +5,7 @@ import shutil
 import time
 import warnings
 import yaml
+import copy
 
 import torch
 import torch.nn as nn
@@ -58,6 +59,12 @@ parser.add_argument('--stage1-loss-queue-length', default=50, type=int, metavar=
                     help='length of the loss queue that is used to compute curr_avg_loss from stage1')
 parser.add_argument('--evaluate-freq', default=10, type=int, metavar='N',
                     help='frequency to evaluate and save (epochs)')
+parser.add_argument('--resume-stage2', default='', type=str, metavar='PATH',
+                    help='path to latest stage1 checkpoint (default: none)')
+parser.add_argument('--lr1', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate for stage 1')
+parser.add_argument('--lr2', default=0.001, type=float,
+                    metavar='LR', help='initial learning rate for stage 2')
 
 
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -65,8 +72,6 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
-                    metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -220,15 +225,27 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
 
-    # define loss functions (criterions) for both training stages and optimizer
+    # Define loss functions (criterions) for both training stages and optimizer
+    # First, separate stage 1 and stage 2 params for optimizers
+    print("args.lr1:", args.lr1)
+    print("args.lr2:", args.lr2)
+    params1 = []
+    params2 = []
+    for n, p in model.named_parameters():
+        if '.ss.' in n:
+            params2.append(p)
+        else:
+            params1.append(p)
+
     criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
     criterion2 = nn.SmoothL1Loss().cuda(args.gpu)
-    optimizer1 = torch.optim.SGD(model.parameters(), args.lr,
+    optimizer1 = torch.optim.SGD(params1, args.lr1,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    optimizer2 = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    #optimizer2 = torch.optim.SGD(params2, args.lr2,
+    #                            momentum=args.momentum,
+    #                            weight_decay=args.weight_decay)
+    optimizer2 = torch.optim.Adam(params2, args.lr2)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -248,11 +265,34 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer1.load_state_dict(checkpoint['optimizer1'])
             optimizer2.load_state_dict(checkpoint['optimizer2'])
+            stage1_avg_loss = checkpoint['stage1_avg_loss']
+            # Load current learning rates
+            args.lr1 = get_lr(optimizer1)
+            args.lr2 = get_lr(optimizer2)
             print("=> loaded checkpoint '{}' (cycle {})"
                   .format(args.resume, checkpoint['cycle']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
+    if args.resume_stage2:
+        if os.path.isfile(args.resume_stage2):
+            print("=> loading checkpoint '{}'".format(args.resume_stage2))
+            checkpoint = torch.load(args.resume_stage2)
+            args.start_cycle = checkpoint['cycle'] - 1
+            best_acc1 = checkpoint['best_acc1']
+            stage1_avg_loss = checkpoint['stage1_avg_loss']
+            # Only load non-SS layers
+            non_ss_dict = {k: v for k, v in checkpoint['state_dict'].items() if '.ss.' not in k}
+            model.load_state_dict(non_ss_dict, strict=False)
+            # Load optimizer
+            optimizer1.load_state_dict(checkpoint['optimizer1'])
+            # Load current learning rate
+            args.lr1 = get_lr(optimizer1)
+            print("=> loaded checkpoint '{}' (cycle {})"
+                  .format(args.resume_stage2, args.start_cycle))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume_stage2))
+        
 
     # Enable benchmark mode
     cudnn.benchmark = True
@@ -330,32 +370,34 @@ def main_worker(gpu, ngpus_per_node, args):
             # Compute total stage1 epoch
             total_epoch = epoch + (c * args.stage1_epochs_per_cycle)
             # Update learning rate
-            adjust_learning_rate(optimizer1, total_epoch, args)
+            adjust_learning_rate(optimizer1, 1, total_epoch, args)
             # Update current epoch's epsilon
             epsilon = eps_schedule1[total_epoch].item()
             # Train STAGE1 for one epoch
             stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args)
+
+        print("Starting Post-Stage1 Eval for Cycle:", c)
+        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1'.format(c))
+
 
         for epoch in range(args.stage2_epochs_per_cycle):
-            # Compute total stage1 epoch
+            # Compute total stage2 epoch
             total_epoch = epoch + (c * args.stage2_epochs_per_cycle)
             # Update learning rate
-            adjust_learning_rate(optimizer2, total_epoch, args)
+            adjust_learning_rate(optimizer2, 2, total_epoch, args)
             # Update current epoch's epsilon
             epsilon = eps_schedule2[total_epoch].item()
             # Train STAGE2 for one epoch
             train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, stage1_avg_loss, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args)
 
-    # Evaluate when all cycles are done
-    print("Final Evaluation:")
-    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, model_name, stage1_avg_loss, args)
-
+        print("Starting Post-Stage2 Eval for Cycle:", c)
+        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2'.format(c))
 
 
 # One full epoch of training on task (stage 1)
@@ -386,6 +428,7 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # Iterate over training images
     for i, (images, target) in enumerate(train_loader):
+        #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -430,6 +473,12 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         #exit()
         optimizer.step()
 
+
+        #new_sd = model.state_dict()
+        #parameter_compare(old_sd, new_sd)
+        #exit()
+
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -469,10 +518,12 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # switch to train mode
     model.train()
+    #model.eval()
     end = time.time()
 
     # Iterate over training samples
     for i, (images, target) in enumerate(train_loader):
+        #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -483,6 +534,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         # Forward batch thru model
         output, ss_output, choices = model(images, epsilon, 2, device='cuda')
 
+        # Generate SS target
         with torch.no_grad():
             # Compute task loss
             task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
@@ -522,6 +574,11 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         #        print(n, p.grad.shape)
         #exit()
         optimizer.step()
+
+        #new_sd = model.state_dict()
+        #parameter_compare(old_sd, new_sd)
+        #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
+        #exit()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -599,7 +656,7 @@ def validate(val_loader, model, criterion, args):
 
 
 
-def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, model_name, stage1_avg_loss, args):
+def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, stage1_avg_loss, args, filename='checkpoint.pth.tar'):
     global best_acc1
     # Evaluate on validation set
     acc1 = validate(val_loader, model, criterion1, args)
@@ -612,13 +669,15 @@ def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cyc
             and args.rank % ngpus_per_node == 0):
         save_checkpoint({
             'cycle': cycle + 1,
+            'stage': stage,
+            'total_epoch': total_epoch + 1,
             'arch': model_name,
             'state_dict': model.state_dict(),
             'best_acc1': best_acc1,
             'optimizer1' : optimizer1.state_dict(),
             'optimizer2' : optimizer2.state_dict(),
             'stage1_avg_loss' : stage1_avg_loss,
-        }, is_best, outdir=args.outdir, filename='checkpoint.pth.tar')
+        }, is_best, outdir=args.outdir, filename=filename)
 
 
 
@@ -674,9 +733,18 @@ class ProgressMeter(object):
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
-def adjust_learning_rate(optimizer, epoch, args):
+def get_lr(optimizer):
+    """Returns current learning rate of an optimizer"""
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
+
+def adjust_learning_rate(optimizer, stage, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    if stage == 1:
+        lr = args.lr1 * (0.1 ** (epoch // 30))
+    else:
+        lr = args.lr2 * (0.1 ** (epoch // 30))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -696,6 +764,15 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+
+def parameter_compare(old_sd, new_sd):
+    for k, _ in old_sd.items():
+        if torch.equal(old_sd[k], new_sd[k]):
+            print(k, "same")
+        else:
+            print(k, "DIFFERENT!")
+
 
 
 if __name__ == '__main__':

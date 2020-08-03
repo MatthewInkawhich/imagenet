@@ -491,17 +491,20 @@ class StriderBlock(nn.Module):
             #print("random!")
             ss_choice = random.choice(valid_options)
 
-        # If a manual stride is specified for this block override choice
+        # If a manual stride is specified for this block, override choice
         if self.manual_stride is not None:
             ss_choice = self.manual_stride
+
+        # Gather loss preds based on selected stride option
+        ss_preds = ss_out[:, ss_choice].unsqueeze(1)
 
         #print("curr_downsample:", curr_downsample)
         #print("invalid_options:", invalid_options)
         #print("ss_choice:", ss_choice)
         #print("ss_out:", ss_out)
+        #print("ss_preds:", ss_preds)
+        #exit() 
 
-        # Gather loss preds based on selected stride option
-        ss_preds = ss_out[:, ss_choice].unsqueeze(1)
         # Convert int choice to tensor 
         ss_choice = torch.tensor([[ss_choice]], device=device)
         return ss_choice, ss_preds
