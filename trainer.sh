@@ -22,7 +22,11 @@
 #python -u main_adaptive.py "configs/strider/strider_R50_16b_random.yaml" --workers 8
 
 #python -u main_adaptive.py "configs/strider/strider_R50_A_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
-python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
+#python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
 #python -u main_adaptive.py "configs/strider/strider_R50_C_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
 #python -u main_adaptive.py "configs/strider/strider_R50_D_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
+CUDA_VISIBLE_DEVICES=1,2,3 python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --workers 6 -b 192 --cycles 1 --stage1-epochs-per-cycle 90 --stage2-epochs-per-cycle 45
+
+
+
 

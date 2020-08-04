@@ -317,6 +317,21 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
+    val_dataset = datasets.ImageFolder(
+        valdir,
+        transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+
+    # Temp**
+    #train_dataset = torch.utils.data.random_split(train_dataset, [20, len(train_dataset)-20])[0]
+    #val_dataset = torch.utils.data.random_split(val_dataset, [20, len(val_dataset)-20])[0]
+    #print("len(train_dataset):", len(train_dataset))
+    #print("len(val_dataset):", len(val_dataset))
+    
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
@@ -324,17 +339,12 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
+        val_dataset,
         batch_size=device_count, shuffle=False,  # batch size for each device should be 1
-        num_workers=args.workers, pin_memory=True)
+        num_workers=args.workers, pin_memory=True, drop_last=True)
 
     if args.evaluate:
         print("EVALUATE flag set, evaluating model now...")
@@ -380,7 +390,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args)
 
         print("Starting Post-Stage1 Eval for Cycle:", c)
-        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1'.format(c))
+        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1.pth.tar'.format(c))
 
 
         for epoch in range(args.stage2_epochs_per_cycle):
@@ -397,7 +407,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args)
 
         print("Starting Post-Stage2 Eval for Cycle:", c)
-        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2'.format(c))
+        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2.pth.tar'.format(c))
 
 
 # One full epoch of training on task (stage 1)
