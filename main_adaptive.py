@@ -707,13 +707,43 @@ def validate_oracle(val_loader, model, criterion, args):
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
+    body_config = args.model_cfg['STRIDER']['BODY_CONFIG']
+    downsample_bounds = args.model_cfg['STRIDER']['DOWNSAMPLE_BOUNDS']
     # Initialize counts tensor
-    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in body_config])
     num_stride_options = 7  # Hardcode this for now
+    stride_options = [[1, 1], [1, 2], [2, 1], [2, 2], [1, .5], [.5, 1], [.5, .5]]
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
+    # Create list of all possible stride options
     option_list = list(range(num_stride_options))
     all_combos = list(itertools.product(option_list, repeat=num_ss_blocks))
+    good_combos = []
+
+    # Trim stride options that are invalid due to bounds
+    for i in range(len(all_combos)):
+        good = True
+        curr_downsample = [4, 4]  # [dH, dW] Stem downsamples H and W by 4x
+        adaptive_idx = 0
+        # Iterate over network configs to check downsample rate
+        for layer_idx in range(len(body_config)):
+            # If the curr layer is adaptive
+            if body_config[layer_idx][0] == 1:
+                stride = stride_options[all_combos[i][adaptive_idx]]
+                curr_downsample = [s1*s2 for s1, s2 in zip(curr_downsample, stride)]
+                adaptive_idx += 1    
+            # If the curr layer is NOT adaptive
+            else:
+                stride_side = body_config[layer_idx][1][0]
+                stride = [stride_side, stride_side]
+                curr_downsample = [s1*s2 for s1, s2 in zip(curr_downsample, stride)]
+            # Check if curr_downsample is now out of bounds
+            curr_bounds = downsample_bounds[layer_idx]
+            if curr_downsample[0] > curr_bounds[0] or curr_downsample[1] > curr_bounds[0] or curr_downsample[0] < curr_bounds[1] or curr_downsample[1] < curr_bounds[1]:
+                good = False
+                break   # Out of bounds, do NOT consider this stride combo
+        if good:    
+            good_combos.append(all_combos[i])
 
 
     # switch to evaluate mode
