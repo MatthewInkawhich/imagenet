@@ -82,10 +82,10 @@ class StriderClassifier(nn.Module):
         self.fc = nn.Linear(out_channels, num_classes)
 
         
-    def forward(self, x, epsilon, stage, device):
+    def forward(self, x, epsilon, stage, device, manual_stride=[]):
         # Forward thru backbone
         #print("input:", x.shape)
-        x, preds, choices = self.body(x, epsilon, stage, device)
+        x, preds, choices = self.body(x, epsilon, stage, device, manual_stride)
         #for i in range(len(x)):
             #print("\ni:", i)
             #print("shape:", x[i].shape)
@@ -177,9 +177,6 @@ class Strider(nn.Module):
             # Else, build a StriderBlock
             else:
                 downsample_bound = self.downsample_bounds[i]
-                manual_stride = None
-                if len(body_config[i]) > 1:
-                    manual_stride = body_config[i][1]
                 block = StriderBlock(
                             in_channels=in_channels,
                             bottleneck_channels=bottleneck_channels,
@@ -188,7 +185,6 @@ class Strider(nn.Module):
                             downsample_bound=downsample_bound,
                             norm_func=self.norm_func,
                             full_residual=full_residual,
-                            manual_stride=manual_stride,
                         )
 
             self.add_module(name, block)
@@ -255,28 +251,32 @@ class Strider(nn.Module):
 
 
 
-    def forward(self, x, epsilon, stage, device):
+    def forward(self, x, epsilon, stage, device, manual_stride):
         #print("input:", x.shape)
         input_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
         all_preds = []
         all_choices = []
         all_outputs = []
         outputs = []
+        curr_strider_block = 0
         # Forward thru stem
         with torch.set_grad_enabled(stage==1):
             x = self.stem(x)
-        #print("stem:", x.shape, x.mean())
+        #print("stem:", x.shape)
         for i, block_name in enumerate(self.block_names):
             # Forward thru current block
             if isinstance(getattr(self, block_name), StriderBlock):
                 # If it is a StriderBlock pass the extra args and get extra return values
-                x, preds, choices = getattr(self, block_name)(x, epsilon, input_resolution, stage, device)
+                man = None if len(manual_stride) == 0 else manual_stride[curr_strider_block]
+                x, preds, choices = getattr(self, block_name)(x, epsilon, input_resolution, stage, device, man)
                 all_preds.append(preds)
                 all_choices.append(choices)
+                curr_strider_block += 1
             else:
                 # If it is NOT a StriderBlock, forward as usual
                 with torch.set_grad_enabled(stage==1):
                     x = getattr(self, block_name)(x)
+            #print("i:{} x:".format(i), x.shape)
 
             # Perform long range residual fusion
             with torch.set_grad_enabled(stage==1):
@@ -392,12 +392,10 @@ class StriderBlock(nn.Module):
         downsample_bound,
         norm_func,
         full_residual=False,
-        manual_stride=None,
     ):
         super(StriderBlock, self).__init__()
 
         self.downsample_bound = downsample_bound
-        self.manual_stride = manual_stride
 
         ### Residual layer
         self.downsample = None
@@ -447,7 +445,7 @@ class StriderBlock(nn.Module):
         self.bn3 = norm_func(out_channels)
 
     
-    def select_stride(self, x, epsilon, input_resolution, device):
+    def select_stride(self, x, epsilon, input_resolution, device, manual_stride):
         # Create list of valid stride options based on current resolution and input resolution
         curr_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
         curr_downsample = torch.ceil(input_resolution / curr_resolution)
@@ -492,8 +490,8 @@ class StriderBlock(nn.Module):
             ss_choice = random.choice(valid_options)
 
         # If a manual stride is specified for this block, override choice
-        if self.manual_stride is not None:
-            ss_choice = self.manual_stride
+        if manual_stride is not None:
+            ss_choice = manual_stride
 
         # Gather loss preds based on selected stride option
         ss_preds = ss_out[:, ss_choice].unsqueeze(1)
@@ -510,7 +508,7 @@ class StriderBlock(nn.Module):
         return ss_choice, ss_preds
 
 
-    def forward(self, x, epsilon, input_resolution, stage, device):
+    def forward(self, x, epsilon, input_resolution, stage, device, manual_stride):
         with torch.set_grad_enabled(stage==1):
             # Store copy of input feature
             identity = x
@@ -522,7 +520,7 @@ class StriderBlock(nn.Module):
     
         # Select stride for conv2
         with torch.set_grad_enabled(stage==2):
-            ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution, device)
+            ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution, device, manual_stride)
 
 
         # Forward thru conv2

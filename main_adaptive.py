@@ -6,6 +6,8 @@ import time
 import warnings
 import yaml
 import copy
+import itertools
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -83,6 +85,12 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
+parser.add_argument('--random-eval', action='store_true',
+                    help='Use random strides when validating')
+parser.add_argument('--batch-eval', action='store_true',
+                    help='Use batched evaluation')
+parser.add_argument('--oracle-eval', action='store_true',
+                    help='Evaluate using all possible strides and choosing the best')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--world-size', default=-1, type=int,
@@ -257,7 +265,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_cycle = checkpoint['cycle']
+            args.start_cycle = checkpoint['cycle'] - 1
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
@@ -267,8 +275,8 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer2.load_state_dict(checkpoint['optimizer2'])
             stage1_avg_loss = checkpoint['stage1_avg_loss']
             # Load current learning rates
-            args.lr1 = get_lr(optimizer1)
-            args.lr2 = get_lr(optimizer2)
+            #args.lr1 = get_lr(optimizer1)
+            #args.lr2 = get_lr(optimizer2)
             print("=> loaded checkpoint '{}' (cycle {})"
                   .format(args.resume, checkpoint['cycle']))
         else:
@@ -301,8 +309,8 @@ def main_worker(gpu, ngpus_per_node, args):
     print("device_count:", device_count)
 
     # Data loading code
-    traindir = '/zero1/data1/ILSVRC2012/train/original'
-    #traindir = './data/ILSVRC2012_val' 
+    #traindir = '/zero1/data1/ILSVRC2012/train/original'
+    traindir = './data/ILSVRC2012_val' 
     valdir = './data/ILSVRC2012_val' 
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -341,14 +349,21 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    if args.batch_eval:
+        val_batch_size = args.batch_size
+    else:
+        val_batch_size = device_count
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=device_count, shuffle=False,  # batch size for each device should be 1
+        batch_size=val_batch_size, shuffle=False,  # batch size for each device should be 1
         num_workers=args.workers, pin_memory=True, drop_last=True)
 
     if args.evaluate:
         print("EVALUATE flag set, evaluating model now...")
-        validate(val_loader, model, criterion1, args)
+        if args.oracle_eval:
+            validate_oracle(val_loader, model, criterion1, args)
+        else:
+            validate(val_loader, model, criterion1, args, random=args.random_eval)
         return
 
     # Create epsilon greedy decay schedule
@@ -389,8 +404,9 @@ def main_worker(gpu, ngpus_per_node, args):
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
                 evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args)
 
-        print("Starting Post-Stage1 Eval for Cycle:", c)
-        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1.pth.tar'.format(c))
+        if args.stage1_epochs_per_cycle > 0:
+            print("Starting Post-Stage1 Eval for Cycle:", c)
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1.pth.tar'.format(c))
 
 
         for epoch in range(args.stage2_epochs_per_cycle):
@@ -406,8 +422,9 @@ def main_worker(gpu, ngpus_per_node, args):
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
                 evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args)
 
-        print("Starting Post-Stage2 Eval for Cycle:", c)
-        evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2.pth.tar'.format(c))
+        if args.stage2_epochs_per_cycle > 0:
+            print("Starting Post-Stage2 Eval for Cycle:", c)
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2.pth.tar'.format(c))
 
 
 # One full epoch of training on task (stage 1)
@@ -604,7 +621,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, random=False):
     print("Running evaluation...")
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -631,8 +648,21 @@ def validate(val_loader, model, criterion, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            # set epsilon to -1 so it is pure greedy selection and use stage 2 forward (doesn't matter)
-            output, preds, choices = model(images, -1, 2, device='cuda')
+            # if random=True set epsilon HIGH
+            if random:
+                output, preds, choices = model(images, 100, 2, device='cuda')
+            # Else set epsilon to -1 so it is pure greedy selection and use stage 2 forward (doesn't matter)
+            else:
+                output, preds, choices = model(images, -1, 2, device='cuda')
+
+            
+            # OPTIONAL: Show image
+            #print("choice:", choices.item())
+            #if choices.item() == 6:
+            #    im2show = images[0].permute(1, 2, 0)
+            #    show_image(im2show)
+            #    exit()
+
             loss = criterion(output, target)
 
             # Track choice counts per SS block
@@ -665,6 +695,87 @@ def validate(val_loader, model, criterion, args):
     return top1.avg
 
 
+
+def validate_oracle(val_loader, model, criterion, args):
+    print("Running evaluation...")
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
+
+    # Initialize counts tensor
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_stride_options = 7  # Hardcode this for now
+    ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
+
+    option_list = list(range(num_stride_options))
+    all_combos = list(itertools.product(option_list, repeat=num_ss_blocks))
+
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
+
+            loss_summary = []
+            output_summary = []
+            # Iterate over all stride combinations
+            for stride_combo in all_combos:
+                # compute output
+                output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
+                loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+                loss_summary.append(loss.unsqueeze(1))
+                output_summary.append(output)
+
+            # Find indices for stride options that lead to lowest loss for each sample in batch
+            loss_summary = torch.cat(loss_summary, dim=1)
+            min_loss_vals, min_loss_inds = torch.min(loss_summary, dim=1)
+            # Compute average loss of best stride options
+            loss = torch.mean(min_loss_vals)
+            # Organize output tensor such that the output for each sample is from the optimal stride option
+            output = []
+            for b in range(target.shape[0]):
+                best_stride_option = min_loss_inds[b]
+                output.append(output_summary[best_stride_option][b].unsqueeze(0))
+            output = torch.cat(output, dim=0)
+
+            # Record stride selections
+            for combo_ind in min_loss_inds:
+                for ss_id in range(len(all_combos[combo_ind])):
+                    ss_choice_counts[ss_id][all_combos[combo_ind][ss_id]] += 1
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        # TODO: this should also be done with the ProgressMeter
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+
+        # Print SS choice counts
+        print("SS Choice Counts:")
+        for i in range(ss_choice_counts.shape[0]):
+            print("SS Block:", i, ss_choice_counts[i])
+
+    return top1.avg
 
 def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, stage1_avg_loss, args, filename='checkpoint.pth.tar'):
     global best_acc1
@@ -782,6 +893,11 @@ def parameter_compare(old_sd, new_sd):
             print(k, "same")
         else:
             print(k, "DIFFERENT!")
+
+
+def show_image(x):
+    plt.imshow(x)
+    plt.show()
 
 
 

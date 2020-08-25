@@ -56,7 +56,7 @@ def main():
     s2_training_epochs = []
     s2_training_losses = []
     s2_training_accs = []
-    #validation_epochs = []
+    validation_epochs = []
     validation_accs = []
     for i in range(len(good_lines)):
         print(good_lines[i])
@@ -64,10 +64,10 @@ def main():
         # Validation case
         if split[0] == '*':
             prev_split = good_lines[i - 1].split()
-            #epoch = int(prev_split[2].replace('[', '').replace(']', ''))
+            epoch = int(prev_split[2].replace('[', '').replace(']', ''))
             acc = float(split[2])
-            #validation_epochs.append(epoch)
-            validation_accs.append(split[2])
+            validation_epochs.append(epoch)
+            validation_accs.append(acc)
         # Stage 1 case
         if 'S1' in good_lines[i]:
             epoch = int(split[2].replace('[', '').replace(']', ''))
@@ -88,6 +88,29 @@ def main():
     # Update stage2 epochs
     s2_training_epochs_cont = [x + s1_training_epochs[-1] + 1 for x in s2_training_epochs]
 
+    # Update validation epochs
+    s1_validation_epochs = []
+    s1_validation_accs = []
+    s2_validation_epochs = []
+    s2_validation_accs = []
+    for i in range(len(validation_epochs)):
+        if i > 0:
+            if validation_epochs[i-1] > validation_epochs[i]:
+                s2_validation_epochs.append(validation_epochs[i] + s1_training_epochs[-1] + 1)            
+                s2_validation_accs.append(validation_accs[i])
+                validation_epochs[i] = validation_epochs[i] + s1_training_epochs[-1] + 1
+            else:
+                s1_validation_epochs.append(validation_epochs[i])
+                s1_validation_accs.append(validation_accs[i])
+        else:
+            s1_validation_epochs.append(validation_epochs[i])
+            s1_validation_accs.append(validation_accs[i])
+    
+    s1_validation_epochs.insert(0, 0)
+    s1_validation_accs.insert(0, 0.001)
+    s2_validation_epochs.insert(0, s1_validation_epochs[-1])
+    s2_validation_accs.insert(0, s1_validation_accs[-1])
+
     print("S1 training")
     for i in range(len(s1_training_epochs)):
         print(s1_training_epochs[i], s1_training_losses[i], s1_training_accs[i])
@@ -98,7 +121,14 @@ def main():
 
     print("Validation")
     for i in range(len(validation_accs)):
-        print(validation_accs[i])
+        print(validation_epochs[i], validation_accs[i])
+
+    print("S1 Validation")
+    for i in range(len(s1_validation_accs)):
+        print(s1_validation_epochs[i], s1_validation_accs[i])
+    print("S2 Validation")
+    for i in range(len(s2_validation_accs)):
+        print(s2_validation_epochs[i], s2_validation_accs[i])
 
 
     # Plot losses/accs
@@ -119,25 +149,23 @@ def main():
     par2.spines["right"].set_visible(True)
 
     host.set_xlabel('Epoch')
-    host.set_ylabel('Training Accuracy')
+    host.set_ylabel('Validation Accuracy')
     par1.set_ylabel('Loss (Cross-Entropy)')
     par2.set_ylabel('Loss (Smooth-L1)')
 
     acc_color = 'green'
-    # ce_loss_color = '#fa433e'
-    # l1_loss_color = '#A42004'
     ce_loss_color = 'tab:red'
     l1_loss_color = 'tab:purple'
 
-    p1, = host.plot(s1_training_epochs, s1_training_accs, color=acc_color, linestyle='-')
-    p2, = host.plot(s2_training_epochs_cont, s2_training_accs, color=acc_color, linestyle='--')
+    p1, = host.plot(s1_validation_epochs, s1_validation_accs, color=acc_color, linestyle='-')
+    p2, = host.plot(s2_validation_epochs, s2_validation_accs, color=acc_color, linestyle='--')
     p3, = par1.plot(s1_training_epochs, s1_training_losses, color=ce_loss_color, linestyle='-')
     p4, = par2.plot(s2_training_epochs_cont, s2_training_losses, color=l1_loss_color, linestyle='--')
 
     host.set_xlim(0, 135)
     host.set_ylim(0, 80)
-    #par1.set_ylim(0, 4)
-    #par2.set_ylim(0, 1)
+    par1.set_ylim(0, 6)
+    par2.set_ylim(0.5, 0.61)
 
     host.yaxis.label.set_color(p1.get_color())
     par1.yaxis.label.set_color(p3.get_color())
@@ -153,7 +181,6 @@ def main():
 
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
-
 
 
 
