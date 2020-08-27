@@ -13,8 +13,8 @@
 #python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --resume "out/strider/strider_R50_ABCD_random_bak/C0_post_S1.pth.tar" --evaluate --random-eval
 #python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --resume "out/strider/strider_R50_ABCD_random/C0_post_S1.pth.tar" --evaluate --random-eval
 #echo "ABCD+60"
-python -u main_adaptive.py "configs/strider/strider_R50_lrr-2-4_ABCD_random.yaml" --resume "out/strider/strider_R50_lrr-2-4_ABCD_random/C0_post_S1.pth.tar" --evaluate --random-eval
-echo "ABCD_lrr-2-4"
+#python -u main_adaptive.py "configs/strider/strider_R50_lrr-2-4_ABCD_random.yaml" --resume "out/strider/strider_R50_lrr-2-4_ABCD_random/C0_post_S1.pth.tar" --evaluate --random-eval
+#echo "ABCD_lrr-2-4"
 
 
 
@@ -67,6 +67,7 @@ echo "ABCD_lrr-2-4"
 #echo "D_6"
 
 #python -u main_adaptive.py "configs/strider/strider_R50_A_random.yaml" --resume "out/strider/strider_R50_A_random/C0_post_S1.pth.tar" --evaluate --oracle --batch-eval
+python -u main_adaptive.py "configs/strider/strider_R50_A_random.yaml" --resume "out/strider/strider_R50_A_random/C0_post_S2.pth.tar" --evaluate --oracle --batch-eval
 #echo "A"
 #python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --resume "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --evaluate --oracle --batch-eval
 #echo "B"

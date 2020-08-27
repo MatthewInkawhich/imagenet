@@ -12,5 +12,5 @@ STRIDER:
   LR_RESIDUAL: []
   LR_ADAPTIVE_FUSION: False
   FPN_ADAPTIVE_FUSION: False
-  DOWNSAMPLE_BOUNDS: []
+  DOWNSAMPLE_BOUNDS: [[64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,8], [64,8], [64,8], [64,8], [64,8], [64,8], [64,8], [64,8], [64,8]]
   RANDOM_STRIDE: False

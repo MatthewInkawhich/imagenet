@@ -745,6 +745,7 @@ def validate_oracle(val_loader, model, criterion, args):
         if good:    
             good_combos.append(all_combos[i])
 
+    print("good_combos:", good_combos)
 
     # switch to evaluate mode
     model.eval()
@@ -759,7 +760,7 @@ def validate_oracle(val_loader, model, criterion, args):
             loss_summary = []
             output_summary = []
             # Iterate over all stride combinations
-            for stride_combo in all_combos:
+            for stride_combo in good_combos:
                 # compute output
                 output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
                 loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
