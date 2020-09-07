@@ -146,7 +146,6 @@ class Strider(nn.Module):
         self.return_features = {}
         body_channels = cfg['BODY_CHANNELS']
         body_config = cfg['BODY_CONFIG']
-        stride_options = cfg['STRIDE_OPTIONS']
         return_features = cfg['RETURN_FEATURES']
         ss_channels = cfg['SS_CHANNELS']
         full_residual = cfg['FULL_RESIDUAL']
@@ -183,7 +182,6 @@ class Strider(nn.Module):
                             bottleneck_channels=bottleneck_channels,
                             ss_channels=ss_channels,
                             out_channels=out_channels,
-                            stride_options=stride_options,
                             downsample_bound=downsample_bound,
                             norm_func=self.norm_func,
                             full_residual=full_residual,
@@ -391,7 +389,6 @@ class StriderBlock(nn.Module):
         bottleneck_channels,
         ss_channels,
         out_channels,
-        stride_options,
         downsample_bound,
         norm_func,
         full_residual=False,
@@ -423,7 +420,15 @@ class StriderBlock(nn.Module):
         
 
         ### Conv2 
-        self.conv2_stride_options = stride_options
+        self.conv2_stride_options = [
+            [False, (1, 1)],
+            [False, (1, 2)],
+            [False, (2, 1)],
+            [False, (2, 2)],
+            [True, (1, 2)],
+            [True, (2, 1)],
+            [True, (2, 2)],
+        ]
         self.ss = StrideSelectorModule(bottleneck_channels, ss_channels, len(self.conv2_stride_options), norm_func)
         self.conv2_weight = nn.Parameter(
             torch.Tensor(bottleneck_channels, bottleneck_channels, 3, 3))

@@ -57,8 +57,12 @@ parser.add_argument('--eps-end', default=0.05, type=float, metavar='N',
                     help='ending epsilon value')
 parser.add_argument('--eps-decay-factor', default=0.75, type=float, metavar='N',
                     help='percentage of total epochs until epsilon decays to eps-end')
+parser.add_argument('--stage1-loss-queue-length', default=50, type=int, metavar='N',
+                    help='length of the loss queue that is used to compute curr_avg_loss from stage1')
 parser.add_argument('--evaluate-freq', default=10, type=int, metavar='N',
                     help='frequency to evaluate and save (epochs)')
+parser.add_argument('--resume-stage2', default='', type=str, metavar='PATH',
+                    help='path to latest stage1 checkpoint (default: none)')
 parser.add_argument('--lr1', default=0.1, type=float,
                     metavar='LR', help='initial learning rate for stage 1')
 parser.add_argument('--lr2', default=0.001, type=float,
@@ -108,6 +112,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
+
 
 def main():
     args = parser.parse_args()
@@ -173,11 +178,8 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
-
-
-    ############################################################################
-    ### INITIALIZE MODEL
-    ############################################################################
+    
+    # create model
     model_name = args.model_cfg['MODEL']
     if model_name in model_names:
         print("Using model from torchvision.models: {}".format(model_name))
@@ -194,10 +196,6 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Error: Model: {} not recognized!".format(model_name))
         exit()
 
-    # Collect valid stride option combos: Many combos are invalid as they take
-    # the feature map out of downsample_bounds
-    valid_combos = get_valid_stride_combos(args)
-    print("valid_combos:", valid_combos)
 
     print(model)
     for n, p in model.named_parameters():
@@ -235,9 +233,6 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
 
-    ############################################################################
-    ### INITIALIZE CRITERIONS AND OPTIMIZERS
-    ############################################################################
     # Define loss functions (criterions) for both training stages and optimizer
     # First, separate stage 1 and stage 2 params for optimizers
     print("args.lr1:", args.lr1)
@@ -260,11 +255,7 @@ def main_worker(gpu, ngpus_per_node, args):
     #                            weight_decay=args.weight_decay)
     optimizer2 = torch.optim.Adam(params2, args.lr2)
 
-
-    ############################################################################
-    ### OPTIONALLY LOAD FROM CHECKPOINT
-    ############################################################################
-    selector_truth = []
+    # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -282,8 +273,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer1.load_state_dict(checkpoint['optimizer1'])
             optimizer2.load_state_dict(checkpoint['optimizer2'])
-            if 'selector_truth' in checkpoint:
-                selector_truth = checkpoint['selector_truth']
+            stage1_avg_loss = checkpoint['stage1_avg_loss']
             # Load current learning rates
             #args.lr1 = get_lr(optimizer1)
             #args.lr2 = get_lr(optimizer2)
@@ -292,27 +282,41 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
+    if args.resume_stage2:
+        if os.path.isfile(args.resume_stage2):
+            print("=> loading checkpoint '{}'".format(args.resume_stage2))
+            checkpoint = torch.load(args.resume_stage2)
+            args.start_cycle = checkpoint['cycle'] - 1
+            best_acc1 = checkpoint['best_acc1']
+            stage1_avg_loss = checkpoint['stage1_avg_loss']
+            # Only load non-SS layers
+            non_ss_dict = {k: v for k, v in checkpoint['state_dict'].items() if '.ss.' not in k}
+            model.load_state_dict(non_ss_dict, strict=False)
+            # Load optimizer
+            optimizer1.load_state_dict(checkpoint['optimizer1'])
+            # Load current learning rate
+            args.lr1 = get_lr(optimizer1)
+            print("=> loaded checkpoint '{}' (cycle {})"
+                  .format(args.resume_stage2, args.start_cycle))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume_stage2))
+        
+
     # Enable benchmark mode
     cudnn.benchmark = True
 
-    # Obtain device count
     device_count = torch.cuda.device_count()
     print("device_count:", device_count)
 
-
-    ############################################################################
-    ### BUILD DATASETS AND DATALOADERS
-    ############################################################################
-    #traindir = '/zero1/data1/ILSVRC2012/train/original'
-    traindir = './data/ILSVRC2012_val' 
+    # Data loading code
+    traindir = '/zero1/data1/ILSVRC2012/train/original'
+    #traindir = './data/ILSVRC2012_val' 
     valdir = './data/ILSVRC2012_val' 
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    ImageFolderWithIndices = add_indices_to_dataset(datasets.ImageFolder)
-
-    train_dataset = ImageFolderWithIndices(
+    train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
             transforms.RandomResizedCrop(224),
@@ -321,7 +325,7 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
-    val_dataset = ImageFolderWithIndices(
+    val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose([
             transforms.Resize(256),
@@ -331,11 +335,10 @@ def main_worker(gpu, ngpus_per_node, args):
         ]))
 
     # Temp**
-    subset_size = 1000
-    train_dataset = torch.utils.data.random_split(train_dataset, [subset_size, len(train_dataset)-subset_size])[0]
-    val_dataset = torch.utils.data.random_split(val_dataset, [subset_size, len(val_dataset)-subset_size])[0]
-    print("len(train_dataset):", len(train_dataset))
-    print("len(val_dataset):", len(val_dataset))
+    #train_dataset = torch.utils.data.random_split(train_dataset, [20, len(train_dataset)-20])[0]
+    #val_dataset = torch.utils.data.random_split(val_dataset, [20, len(val_dataset)-20])[0]
+    #print("len(train_dataset):", len(train_dataset))
+    #print("len(val_dataset):", len(val_dataset))
     
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -355,22 +358,15 @@ def main_worker(gpu, ngpus_per_node, args):
         batch_size=val_batch_size, shuffle=False,  # batch size for each device should be 1
         num_workers=args.workers, pin_memory=True, drop_last=True)
 
-
-    ############################################################################
-    ### EVALUATE
-    ############################################################################
     if args.evaluate:
         print("EVALUATE flag set, evaluating model now...")
         if args.oracle_eval:
-            validate_oracle(val_loader, model, criterion1, valid_combos, args)
+            validate_oracle(val_loader, model, criterion1, args)
         else:
             validate(val_loader, model, criterion1, args, random=args.random_eval)
         return
 
-
-    ############################################################################
-    ### CREATE EPSILON GREEDY DECAY SCHEDULE
-    ############################################################################
+    # Create epsilon greedy decay schedule
     stage1_total_epochs = args.cycles * args.stage1_epochs_per_cycle
     stage2_total_epochs = args.cycles * args.stage2_epochs_per_cycle
     if args.model_cfg['STRIDER']['RANDOM_STRIDE']:
@@ -389,13 +385,12 @@ def main_worker(gpu, ngpus_per_node, args):
     print("eps_schedule2:", eps_schedule2, eps_schedule2.shape)
 
 
-    ############################################################################
-    ### EPOCH LOOP
-    ############################################################################
-    # Repeat for args.cycles cycles
+
+    ##############
+    # EPOCH LOOP
+    ##############
     for c in range(args.start_cycle, args.cycles):
         print("Starting cycle:", c)
-        # Train Stage1
         for epoch in range(args.stage1_epochs_per_cycle):
             # Compute total stage1 epoch
             total_epoch = epoch + (c * args.stage1_epochs_per_cycle)
@@ -404,20 +399,15 @@ def main_worker(gpu, ngpus_per_node, args):
             # Update current epoch's epsilon
             epsilon = eps_schedule1[total_epoch].item()
             # Train STAGE1 for one epoch
-            train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
+            stage1_avg_loss = train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
             # Evaluate if necessary
-            #if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-            #    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, selector_truth, args)
+            if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args)
 
-        # Evaluate post Stage1
-        #if args.stage1_epochs_per_cycle > 0:
-        #    print("Starting Post-Stage1 Eval for Cycle:", c)
-        #    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, selector_truth, args, filename='C{}_post_S1.pth.tar'.format(c))
+        if args.stage1_epochs_per_cycle > 0:
+            print("Starting Post-Stage1 Eval for Cycle:", c)
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S1.pth.tar'.format(c))
 
-        # Get selector truth
-        selector_truth = collect_selector_truth(train_dataset, train_loader, model, criterion1)
-    
-        exit()
 
         for epoch in range(args.stage2_epochs_per_cycle):
             # Compute total stage2 epoch
@@ -427,21 +417,18 @@ def main_worker(gpu, ngpus_per_node, args):
             # Update current epoch's epsilon
             epsilon = eps_schedule2[total_epoch].item()
             # Train STAGE2 for one epoch
-            train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, selector_truth, args)
+            train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, stage1_avg_loss, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, selector_truth, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args)
 
         if args.stage2_epochs_per_cycle > 0:
             print("Starting Post-Stage2 Eval for Cycle:", c)
-            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, selector_truth, args, filename='C{}_post_S2.pth.tar'.format(c))
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, stage1_avg_loss, args, filename='C{}_post_S2.pth.tar'.format(c))
 
 
-
-############################################################################
-### STAGE 1
-############################################################################
 # One full epoch of training on task (stage 1)
+# Returns average training task loss from last args.stage1_loss_queue_length
 def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, args):
     print("Starting Stage 1, Epoch:", epoch)
     batch_time = AverageMeter('Time', ':6.3f')
@@ -456,19 +443,18 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
-    num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
+    num_stride_options = 7  # Hardcode this for now
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # switch to train mode
     model.train()
     end = time.time()
 
+    # Create loss queue
+    loss_queue = []
+
     # Iterate over training images
-    for i, (images, target, indices) in enumerate(train_loader):
-        print("images:", images.shape)
-        print("target:", target, target.shape)
-        print("indices:", indices, indices.shape)
-        exit()
+    for i, (images, target) in enumerate(train_loader):
         #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
@@ -498,6 +484,11 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
+        # Add loss to loss queue
+        loss_queue.append(loss.item())
+        if len(loss_queue) > args.stage1_loss_queue_length:
+            loss_queue.pop(0)
+
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
@@ -509,9 +500,11 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         #exit()
         optimizer.step()
 
+
         #new_sd = model.state_dict()
         #parameter_compare(old_sd, new_sd)
         #exit()
+
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -520,95 +513,20 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         if i % args.print_freq == 0:
             progress.display(i)
 
+
     # Print SS choice counts
     print("SS Choice Counts:")
     for i in range(ss_choice_counts.shape[0]):
         print("SS Block:", i, ss_choice_counts[i])
 
+    # After all iterations, compute average of last N losses
+    loss_queue_avg = sum(loss_queue) / len(loss_queue)
+    return loss_queue_avg
 
 
-############################################################################
-### COLLECT SELECTOR TRUTH
-############################################################################
-def collect_selector_truth(train_dataset, train_loader, model, criterion, valid_combos):
-    # Initialize selector_truth
-    selector_truth = [{} for i in range(len(train_dataset))]
-    
-    # Set to eval mode so we don't change BN averages
-    model.eval()
-    
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target, indices) in enumerate(train_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-        
-            curr_truth = {}
 
-            loss_summary = []
-            output_summary = []
-            # Iterate over all stride combinations
-            for stride_combo in valid_combos:
-                # compute output
-                output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
-                loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-                loss_summary.append(loss.unsqueeze(1))
-                output_summary.append(output)
-
-            loss_summary = torch.cat(loss_summary, dim=1)
-            # Find indices for stride options that lead to lowest (and highest) loss for each sample in batch
-            min_loss_vals, min_loss_inds = torch.min(loss_summary, dim=1)
-            max_loss_vals, max_loss_inds = torch.max(loss_summary, dim=1)
-            # Compute average loss of best stride options
-            loss_best = torch.mean(min_loss_vals)
-            loss_worst = torch.mean(max_loss_vals)
-            # Organize output tensor such that the output for each sample is from the optimal stride option
-            output_best = []
-            output_worst = []
-            for b in range(target.shape[0]):
-                best_stride_option = min_loss_inds[b]
-                worst_stride_option = max_loss_inds[b]
-                output_best.append(output_summary[best_stride_option][b].unsqueeze(0))
-                output_worst.append(output_summary[worst_stride_option][b].unsqueeze(0))
-            output_best = torch.cat(output_best, dim=0)
-            output_worst = torch.cat(output_worst, dim=0)
-
-            # Record stride selections
-            for combo_ind in min_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_best[ss_id][valid_combos[combo_ind][ss_id]] += 1
-            for combo_ind in max_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_worst[ss_id][valid_combos[combo_ind][ss_id]] += 1
-
-            # measure accuracy and record loss
-            acc1_best, acc5_best = accuracy(output_best, target, topk=(1, 5))
-            losses_best.update(loss_best.item(), images.size(0))
-            top1_best.update(acc1_best[0], images.size(0))
-            top5_best.update(acc5_best[0], images.size(0))
-
-            acc1_worst, acc5_worst = accuracy(output_worst, target, topk=(1, 5))
-            losses_worst.update(loss_worst.item(), images.size(0))
-            top1_worst.update(acc1_worst[0], images.size(0))
-            top5_worst.update(acc5_worst[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % args.print_freq == 0:
-                progress_worst.display(i)
-                progress_best.display(i)
-
-    return selector_truth
-
-
-############################################################################
-### STAGE 2
-############################################################################
 # One full epoch of training SS modules (stage 2)
-def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, selector_truth, args):
+def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, stage1_avg_loss, args):
     print("Starting Stage 2, Epoch:", epoch)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -622,7 +540,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
-    num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
+    num_stride_options = 7  # Hardcode this for now
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # switch to train mode
@@ -703,9 +621,6 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
 
 
-############################################################################
-### VALIDATE 
-############################################################################
 def validate(val_loader, model, criterion, args, random=False):
     print("Running evaluation...")
     batch_time = AverageMeter('Time', ':6.3f')
@@ -719,7 +634,7 @@ def validate(val_loader, model, criterion, args, random=False):
 
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
-    num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
+    num_stride_options = 7  # Hardcode this for now
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # switch to evaluate mode
@@ -727,7 +642,7 @@ def validate(val_loader, model, criterion, args, random=False):
 
     with torch.no_grad():
         end = time.time()
-        for i, (images, target, indices) in enumerate(val_loader):
+        for i, (images, target) in enumerate(val_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -781,144 +696,42 @@ def validate(val_loader, model, criterion, args, random=False):
 
 
 
-############################################################################
-### VALIDATE W/ ORACLE
-############################################################################
-def validate_oracle(val_loader, model, criterion, valid_combos, args):
+def validate_oracle(val_loader, model, criterion, args):
     print("Running evaluation...")
     batch_time = AverageMeter('Time', ':6.3f')
-    losses_best = AverageMeter('Loss', ':.4e')
-    top1_best = AverageMeter('Acc@1', ':6.2f')
-    top5_best = AverageMeter('Acc@5', ':6.2f')
-    progress_best = ProgressMeter(
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
         len(val_loader),
-        [batch_time, losses_best, top1_best, top5_best],
-        prefix='BEST:  ')
-    losses_worst = AverageMeter('Loss', ':.4e')
-    top1_worst = AverageMeter('Acc@1', ':6.2f')
-    top5_worst = AverageMeter('Acc@5', ':6.2f')
-    progress_worst = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses_worst, top1_worst, top5_worst],
-        prefix='WORST: ')
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
 
-    # Initialize counts tensor
-    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
-    num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
-    ss_choice_counts_best = torch.zeros(num_ss_blocks, num_stride_options)
-    ss_choice_counts_worst = torch.zeros(num_ss_blocks, num_stride_options)
-
-    # switch to evaluate mode
-    model.eval()
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target, indices) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
-            loss_summary = []
-            output_summary = []
-            # Iterate over all stride combinations
-            for stride_combo in valid_combos:
-                # compute output
-                output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
-                loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-                loss_summary.append(loss.unsqueeze(1))
-                output_summary.append(output)
-
-            loss_summary = torch.cat(loss_summary, dim=1)
-            # Find indices for stride options that lead to lowest (and highest) loss for each sample in batch
-            min_loss_vals, min_loss_inds = torch.min(loss_summary, dim=1)
-            max_loss_vals, max_loss_inds = torch.max(loss_summary, dim=1)
-            # Compute average loss of best stride options
-            loss_best = torch.mean(min_loss_vals)
-            loss_worst = torch.mean(max_loss_vals)
-            # Organize output tensor such that the output for each sample is from the optimal stride option
-            output_best = []
-            output_worst = []
-            for b in range(target.shape[0]):
-                best_stride_option = min_loss_inds[b]
-                worst_stride_option = max_loss_inds[b]
-                output_best.append(output_summary[best_stride_option][b].unsqueeze(0))
-                output_worst.append(output_summary[worst_stride_option][b].unsqueeze(0))
-            output_best = torch.cat(output_best, dim=0)
-            output_worst = torch.cat(output_worst, dim=0)
-
-            # Record stride selections
-            for combo_ind in min_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_best[ss_id][valid_combos[combo_ind][ss_id]] += 1
-            for combo_ind in max_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_worst[ss_id][valid_combos[combo_ind][ss_id]] += 1
-
-            # measure accuracy and record loss
-            acc1_best, acc5_best = accuracy(output_best, target, topk=(1, 5))
-            losses_best.update(loss_best.item(), images.size(0))
-            top1_best.update(acc1_best[0], images.size(0))
-            top5_best.update(acc5_best[0], images.size(0))
-
-            acc1_worst, acc5_worst = accuracy(output_worst, target, topk=(1, 5))
-            losses_worst.update(loss_worst.item(), images.size(0))
-            top1_worst.update(acc1_worst[0], images.size(0))
-            top5_worst.update(acc5_worst[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % args.print_freq == 0:
-                progress_worst.display(i)
-                progress_best.display(i)
-
-        # TODO: this should also be done with the ProgressMeter
-        print('WORST: * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
-              .format(top1=top1_worst, top5=top5_worst, loss=losses_worst))
-        print('BEST:  * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
-              .format(top1=top1_best, top5=top5_best, loss=losses_best))
-
-        # Print SS choice counts
-        print("\nSS Choice Counts (WORST):")
-        for i in range(ss_choice_counts_worst.shape[0]):
-            print("SS Block:", i, ss_choice_counts_worst[i])
-        print("\nSS Choice Counts (BEST):")
-        for i in range(ss_choice_counts_best.shape[0]):
-            print("SS Block:", i, ss_choice_counts_best[i])
-
-
-
-############################################################################
-### GET VALID STRIDE OPTION COMBOS
-############################################################################
-def get_valid_stride_combos(args):
     body_config = args.model_cfg['STRIDER']['BODY_CONFIG']
-    stride_options = args.model_cfg['STRIDER']['STRIDE_OPTIONS']
     downsample_bounds = args.model_cfg['STRIDER']['DOWNSAMPLE_BOUNDS']
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in body_config])
-    num_stride_options = len(stride_options)
-    stride_options_scales = [[1/x[1][0], 1/x[1][1]] if x[0] else x[1] for x in stride_options]
+    num_stride_options = 7  # Hardcode this for now
+    stride_options = [[1, 1], [1, 2], [2, 1], [2, 2], [1, .5], [.5, 1], [.5, .5]]
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
 
     # Create list of all possible stride options
     option_list = list(range(num_stride_options))
     all_combos = list(itertools.product(option_list, repeat=num_ss_blocks))
-    valid_combos = []
+    good_combos = []
 
     # Trim stride options that are invalid due to bounds
     for i in range(len(all_combos)):
-        valid = True
+        good = True
         curr_downsample = [4, 4]  # [dH, dW] Stem downsamples H and W by 4x
         adaptive_idx = 0
         # Iterate over network configs to check downsample rate
         for layer_idx in range(len(body_config)):
             # If the curr layer is adaptive
             if body_config[layer_idx][0] == 1:
-                stride = stride_options_scales[all_combos[i][adaptive_idx]]
+                stride = stride_options[all_combos[i][adaptive_idx]]
                 curr_downsample = [s1*s2 for s1, s2 in zip(curr_downsample, stride)]
-                adaptive_idx += 1 
+                adaptive_idx += 1    
             # If the curr layer is NOT adaptive
             else:
                 stride_side = body_config[layer_idx][1][0]
@@ -927,19 +740,75 @@ def get_valid_stride_combos(args):
             # Check if curr_downsample is now out of bounds
             curr_bounds = downsample_bounds[layer_idx]
             if curr_downsample[0] > curr_bounds[0] or curr_downsample[1] > curr_bounds[0] or curr_downsample[0] < curr_bounds[1] or curr_downsample[1] < curr_bounds[1]:
-                valid = False
+                good = False
                 break   # Out of bounds, do NOT consider this stride combo
-        if valid:    
-            valid_combos.append(all_combos[i])
+        if good:    
+            good_combos.append(all_combos[i])
 
-    return valid_combos
+    print("good_combos:", good_combos)
 
+    # switch to evaluate mode
+    model.eval()
 
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
 
-############################################################################
-### EVALUATE AND SAVE
-############################################################################
-def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, selector_truth, args, filename='checkpoint.pth.tar'):
+            loss_summary = []
+            output_summary = []
+            # Iterate over all stride combinations
+            for stride_combo in good_combos:
+                # compute output
+                output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
+                loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+                loss_summary.append(loss.unsqueeze(1))
+                output_summary.append(output)
+
+            # Find indices for stride options that lead to lowest loss for each sample in batch
+            loss_summary = torch.cat(loss_summary, dim=1)
+            min_loss_vals, min_loss_inds = torch.min(loss_summary, dim=1)
+            # Compute average loss of best stride options
+            loss = torch.mean(min_loss_vals)
+            # Organize output tensor such that the output for each sample is from the optimal stride option
+            output = []
+            for b in range(target.shape[0]):
+                best_stride_option = min_loss_inds[b]
+                output.append(output_summary[best_stride_option][b].unsqueeze(0))
+            output = torch.cat(output, dim=0)
+
+            # Record stride selections
+            for combo_ind in min_loss_inds:
+                for ss_id in range(len(all_combos[combo_ind])):
+                    ss_choice_counts[ss_id][all_combos[combo_ind][ss_id]] += 1
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        # TODO: this should also be done with the ProgressMeter
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+
+        # Print SS choice counts
+        print("SS Choice Counts:")
+        for i in range(ss_choice_counts.shape[0]):
+            print("SS Block:", i, ss_choice_counts[i])
+
+    return top1.avg
+
+def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, stage1_avg_loss, args, filename='checkpoint.pth.tar'):
     global best_acc1
     # Evaluate on validation set
     acc1 = validate(val_loader, model, criterion1, args)
@@ -959,14 +828,11 @@ def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cyc
             'best_acc1': best_acc1,
             'optimizer1' : optimizer1.state_dict(),
             'optimizer2' : optimizer2.state_dict(),
-            'selector_truth' : selector_truth,
+            'stage1_avg_loss' : stage1_avg_loss,
         }, is_best, outdir=args.outdir, filename=filename)
 
 
 
-############################################################################
-### SAVE CHECKPOINT
-############################################################################
 def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pth.tar'):
     if not os.path.exists(outdir):
         os.makedirs(outdir)
@@ -978,9 +844,6 @@ def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pt
 
 
 
-############################################################################
-### PERFORMANCE METER CLASSES
-############################################################################
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self, name, fmt=':f'):
@@ -1020,24 +883,6 @@ class ProgressMeter(object):
         num_digits = len(str(num_batches // 1))
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
-
-
-############################################################################
-### HELPERS
-############################################################################
-def add_indices_to_dataset(cls):
-    """
-    Modifier the given Dataset class to return data, target, index instead
-    of just data, target.
-    source: https://discuss.pytorch.org/t/how-to-retrieve-the-sample-indices-of-a-mini-batch/7948/19
-    """
-    def __getitem__(self, index):
-        data, target = cls.__getitem__(self, index)
-        return data, target, index
-
-    return type(cls.__name__, (cls,), {
-        '__getitem__': __getitem__,
-    })
 
 
 def get_lr(optimizer):
