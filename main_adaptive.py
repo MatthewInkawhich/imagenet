@@ -59,6 +59,10 @@ parser.add_argument('--eps-decay-factor', default=0.75, type=float, metavar='N',
                     help='percentage of total epochs until epsilon decays to eps-end')
 parser.add_argument('--evaluate-freq', default=10, type=int, metavar='N',
                     help='frequency to evaluate and save (epochs)')
+parser.add_argument('--resume-stage2', default='', type=str, metavar='PATH',
+                    help='path to latest stage1 checkpoint (default: none)')
+parser.add_argument('--load-selector-truth', default='', type=str, metavar='PATH',
+                    help='path to selector_truth file (default: none)')
 parser.add_argument('--lr1', default=0.1, type=float,
                     metavar='LR', help='initial learning rate for stage 1')
 parser.add_argument('--lr2', default=0.001, type=float,
@@ -251,7 +255,7 @@ def main_worker(gpu, ngpus_per_node, args):
             params1.append(p)
 
     criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
-    criterion2 = nn.SmoothL1Loss().cuda(args.gpu)
+    criterion2 = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer1 = torch.optim.SGD(params1, args.lr1,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -264,7 +268,6 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################################################
     ### OPTIONALLY LOAD FROM CHECKPOINT
     ############################################################################
-    selector_truth = []
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -282,8 +285,6 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer1.load_state_dict(checkpoint['optimizer1'])
             optimizer2.load_state_dict(checkpoint['optimizer2'])
-            if 'selector_truth' in checkpoint:
-                selector_truth = checkpoint['selector_truth']
             # Load current learning rates
             #args.lr1 = get_lr(optimizer1)
             #args.lr2 = get_lr(optimizer2)
@@ -291,6 +292,37 @@ def main_worker(gpu, ngpus_per_node, args):
                   .format(args.resume, checkpoint['cycle']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
+            exit()
+
+    if args.resume_stage2:
+        if os.path.isfile(args.resume_stage2):
+            print("=> loading checkpoint '{}'".format(args.resume_stage2))
+            checkpoint = torch.load(args.resume_stage2)
+            args.start_cycle = checkpoint['cycle'] - 1
+            best_acc1 = checkpoint['best_acc1']
+            # Only load non-SS layers
+            non_ss_dict = {k: v for k, v in checkpoint['state_dict'].items() if '.ss.' not in k}
+            model.load_state_dict(non_ss_dict, strict=False)
+            # Load optimizer
+            optimizer1.load_state_dict(checkpoint['optimizer1'])
+            # Load current learning rate
+            #args.lr1 = get_lr(optimizer1)
+            print("=> loaded checkpoint '{}' (cycle {})"
+                  .format(args.resume_stage2, args.start_cycle))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume_stage2))
+            exit()
+        
+    # Optionally load the selector_truth for the first stage2 train
+    selector_truth = []
+    if args.load_selector_truth:
+        if os.path.isfile(args.load_selector_truth):
+            print("=> loading selector truth lookup '{}'".format(args.load_selector_truth))
+            selector_truth = torch.load(args.load_selector_truth)
+        else:
+            print("=> no selector_truth found at '{}'".format(args.load_selector_truth))
+            exit()
+
 
     # Enable benchmark mode
     cudnn.benchmark = True
@@ -331,9 +363,9 @@ def main_worker(gpu, ngpus_per_node, args):
         ]))
 
     # Temp**
-    subset_size = 1000
-    train_dataset = torch.utils.data.random_split(train_dataset, [subset_size, len(train_dataset)-subset_size])[0]
-    val_dataset = torch.utils.data.random_split(val_dataset, [subset_size, len(val_dataset)-subset_size])[0]
+    #subset_size = 8
+    #train_dataset = torch.utils.data.random_split(train_dataset, [subset_size, len(train_dataset)-subset_size])[0]
+    #val_dataset = torch.utils.data.random_split(val_dataset, [subset_size, len(val_dataset)-subset_size])[0]
     print("len(train_dataset):", len(train_dataset))
     print("len(val_dataset):", len(val_dataset))
     
@@ -344,7 +376,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=False) #True)
 
     if args.batch_eval:
         val_batch_size = args.batch_size
@@ -406,19 +438,20 @@ def main_worker(gpu, ngpus_per_node, args):
             # Train STAGE1 for one epoch
             train_stage1(train_loader, model, criterion1, optimizer1, epoch, total_epoch, epsilon, args)
             # Evaluate if necessary
-            #if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-            #    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, selector_truth, args)
+            if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, args)
 
         # Evaluate post Stage1
-        #if args.stage1_epochs_per_cycle > 0:
-        #    print("Starting Post-Stage1 Eval for Cycle:", c)
-        #    evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, selector_truth, args, filename='C{}_post_S1.pth.tar'.format(c))
+        if args.stage1_epochs_per_cycle > 0:
+            print("Starting Post-Stage1 Eval for Cycle:", c)
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 1, total_epoch, model_name, args, filename='C{}_post_S1.pth.tar'.format(c))
 
-        # Get selector truth
-        selector_truth = collect_selector_truth(train_dataset, train_loader, model, criterion1)
-    
-        exit()
+        # Get selector truth (if this is not the first S2 train after loading with load_selector_truth)
+        if not selector_truth:
+            selector_truth = collect_selector_truth(train_loader, len(train_dataset), model, criterion1, valid_combos, args)
+            save_selector_truth(selector_truth, args.outdir)
 
+        # Train Stage2
         for epoch in range(args.stage2_epochs_per_cycle):
             # Compute total stage2 epoch
             total_epoch = epoch + (c * args.stage2_epochs_per_cycle)
@@ -430,11 +463,14 @@ def main_worker(gpu, ngpus_per_node, args):
             train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, selector_truth, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
-                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, selector_truth, args)
+                evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, args)
 
         if args.stage2_epochs_per_cycle > 0:
             print("Starting Post-Stage2 Eval for Cycle:", c)
-            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, selector_truth, args, filename='C{}_post_S2.pth.tar'.format(c))
+            evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, args, filename='C{}_post_S2.pth.tar'.format(c))
+
+        # To ensure we don't load truths from file again, set selector_truth to empty
+        selector_truth = []
 
 
 
@@ -530,76 +566,109 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 ############################################################################
 ### COLLECT SELECTOR TRUTH
 ############################################################################
-def collect_selector_truth(train_dataset, train_loader, model, criterion, valid_combos):
-    # Initialize selector_truth
-    selector_truth = [{} for i in range(len(train_dataset))]
+def collect_selector_truth(data_loader, dataset_length, model, criterion, valid_combos, args):
+    print("Starting Selector Truth Collection:")
+    batch_time = AverageMeter('Time', ':6.3f')
+    progress = ProgressMeter(
+        len(data_loader),
+        [batch_time],
+        prefix="STCollect")
+
+    # Useful vals
+    num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
+    num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
+
+    # Initialize all_losses to high values
+    all_losses_shape = [num_stride_options for i in range(num_ss_blocks)]
+    all_losses_shape.insert(0, dataset_length)
+    all_losses = torch.zeros(all_losses_shape, dtype=torch.float32) + 1000.0
     
     # Set to eval mode so we don't change BN averages
     model.eval()
     
+    # Fill all_losses: Iterate over all training images, and record loss for each sample/stride combo
+    print("Collecting all_losses...")
     with torch.no_grad():
         end = time.time()
-        for i, (images, target, indices) in enumerate(train_loader):
+        for i, (images, target, indices) in enumerate(data_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
-        
-            curr_truth = {}
-
-            loss_summary = []
-            output_summary = []
-            # Iterate over all stride combinations
+            # Iterate over all valid stride combinations
             for stride_combo in valid_combos:
-                # compute output
+                #print("\n\nstride_combo:", stride_combo)
+                # Compute output
                 output, preds, choices = model(images, -1, 2, device='cuda', manual_stride=stride_combo)
+                # Compute loss for each input in batch
                 loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-                loss_summary.append(loss.unsqueeze(1))
-                output_summary.append(output)
-
-            loss_summary = torch.cat(loss_summary, dim=1)
-            # Find indices for stride options that lead to lowest (and highest) loss for each sample in batch
-            min_loss_vals, min_loss_inds = torch.min(loss_summary, dim=1)
-            max_loss_vals, max_loss_inds = torch.max(loss_summary, dim=1)
-            # Compute average loss of best stride options
-            loss_best = torch.mean(min_loss_vals)
-            loss_worst = torch.mean(max_loss_vals)
-            # Organize output tensor such that the output for each sample is from the optimal stride option
-            output_best = []
-            output_worst = []
-            for b in range(target.shape[0]):
-                best_stride_option = min_loss_inds[b]
-                worst_stride_option = max_loss_inds[b]
-                output_best.append(output_summary[best_stride_option][b].unsqueeze(0))
-                output_worst.append(output_summary[worst_stride_option][b].unsqueeze(0))
-            output_best = torch.cat(output_best, dim=0)
-            output_worst = torch.cat(output_worst, dim=0)
-
-            # Record stride selections
-            for combo_ind in min_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_best[ss_id][valid_combos[combo_ind][ss_id]] += 1
-            for combo_ind in max_loss_inds:
-                for ss_id in range(len(valid_combos[combo_ind])):
-                    ss_choice_counts_worst[ss_id][valid_combos[combo_ind][ss_id]] += 1
-
-            # measure accuracy and record loss
-            acc1_best, acc5_best = accuracy(output_best, target, topk=(1, 5))
-            losses_best.update(loss_best.item(), images.size(0))
-            top1_best.update(acc1_best[0], images.size(0))
-            top5_best.update(acc5_best[0], images.size(0))
-
-            acc1_worst, acc5_worst = accuracy(output_worst, target, topk=(1, 5))
-            losses_worst.update(loss_worst.item(), images.size(0))
-            top1_worst.update(acc1_worst[0], images.size(0))
-            top5_worst.update(acc5_worst[0], images.size(0))
-
-            # measure elapsed time
+                # Record loss of each batch element in all_losses
+                for batch_idx in range(len(indices)):
+                    #print("\nbatch_idx:", batch_idx)
+                    sample_idx = indices[batch_idx].item()
+                    #print("sample_idx:", sample_idx)
+                    all_losses_idx = (sample_idx,) + stride_combo
+                    #print("all_losses_idx:", all_losses_idx)
+                    #print("loss:", loss[batch_idx])
+                    all_losses[all_losses_idx] = loss[batch_idx]
+            # Measure elapsed time and show progress
             batch_time.update(time.time() - end)
             end = time.time()
-
             if i % args.print_freq == 0:
-                progress_worst.display(i)
-                progress_best.display(i)
+                progress.display(i)
+
+    #print("\n\nall_losses:", all_losses, all_losses.shape)
+    #print("Recorded losses:", (all_losses != 1000.0).sum())
+
+    # Next, get all unique valid prefixes
+    prefixes = []
+    for i in range(len(valid_combos)):
+        for j in range(len(valid_combos[i])):
+            prefixes.append(valid_combos[i][:j])
+    prefixes = list(set(prefixes))
+    prefixes.sort()  # Sort by value
+    prefixes.sort(key=lambda t: len(t)) # Sort by length
+    #print("\nvalid prefixes:", prefixes)
+
+    # Initialize and fill the selector_truth lookup
+    # Every sample has an entry that is a dict of (prefix:true next stride option)
+    print("Creating selector_truth lookup...")
+    selector_truth = [{} for i in range(dataset_length)]
+    for sample_idx in range(dataset_length):
+        # Start new dict for this sample
+        curr_dict = {}
+        # Iterate over prefixes
+        for prefix in prefixes:
+            #print("\nprefix:", prefix)
+            # Get coord of min loss for the current prefix
+            prefix_with_sample_idx = (sample_idx,) + prefix
+            # Record the truth_idx (we want to find the stride option that comes immediately AFTER prefix)
+            truth_idx = len(prefix_with_sample_idx)
+            #print("prefix_with_sample_idx:", prefix_with_sample_idx)
+            min_idx = torch.argmin(all_losses[prefix_with_sample_idx])
+            #print("size_of_argmin_tensor:", tuple(all_losses[prefix_with_sample_idx].shape))
+
+            #print("min_idx:", min_idx)
+            min_coord = unravel_index(min_idx.item(), tuple(all_losses[prefix_with_sample_idx].shape))
+            min_coord_full = prefix_with_sample_idx + min_coord
+            #print("min_coord:", min_coord)
+            #print("min_coord_full:", min_coord_full)
+
+            # The truth is the index value corresponding to the truth_idx
+            #print("truth_idx:", truth_idx)
+            truth = min_coord_full[truth_idx]
+            #print("truth:", truth)
+            # Update current sample's dict
+            curr_dict[prefix] = truth
+
+        selector_truth[sample_idx].update(curr_dict)
+
+
+    #print("\n\nselector_truth:")
+    #for d_idx in range(len(selector_truth)):
+    #    print(d_idx)
+    #    for k, v in selector_truth[d_idx].items():
+    #        print(k, v)
+    #exit()
 
     return selector_truth
 
@@ -631,7 +700,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
     end = time.time()
 
     # Iterate over training samples
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, target, indices) in enumerate(train_loader):
         #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
@@ -641,65 +710,83 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         target = target.cuda(args.gpu, non_blocking=True)
 
         # Forward batch thru model
+        # TEMP: REMOVE AFTER!
+        #epsilon = 0
         output, ss_output, choices = model(images, epsilon, 2, device='cuda')
+        device_sample_counts = model.module.get_device_sample_counts()
 
-        # Generate SS target
-        with torch.no_grad():
-            # Compute task loss
-            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-            # Compute ss_target
-            ss_target = (task_loss.detach() - stage1_avg_loss) / stage1_avg_loss
-            ss_target = torch.repeat_interleave(ss_target.unsqueeze(1), ss_output.shape[1], dim=1)
-            # Note that the ss_output and ss_target should be of shape: [N, #adaptive blocks]
+        print("\n\noutput:", output.shape)
+        print("ss_output:", ss_output, ss_output.shape)
+        print("choices:", choices, choices.shape)
+        print("device_sample_counts:", device_sample_counts)
 
-        # Compute SS loss
-        ss_loss = criterion(ss_output, ss_target)
+        #ss_output = ss_output.permute(1, 0, 2)
+        #print("\nnew ss_output:", ss_output, ss_output.shape)
+        # Slice ss_output by ss block, compute loss for each block separately and add them
+        for ss_id in range(ss_output.shape[1]):
+            curr_ss_output = ss_output[:, ss_id, :]
+            print("curr_ss_output:", curr_ss_output, curr_ss_output.shape)
 
-        # Track choice counts per SS block
-        for ss_id in range(choices.shape[1]):
-            for j in range(choices.shape[0]):
-                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
+        exit()
 
-        #print("\noutput:", output.shape)
-        #print("task loss:", task_loss, task_loss.shape)
-        #print("choices:", choices, choices.shape)
-        #print("ss_output:", ss_output, ss_output.shape, ss_output.dtype)
-        #print("ss_target:", ss_target, ss_target.shape, ss_target.dtype)
-        #print("ss_loss:", ss_loss, ss_loss.shape)
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(ss_loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        ss_loss.backward()
-        #for n, p in model.named_parameters():
-        #    if p.grad is None or p.grad.abs().sum() == 0:
-        #        print(n, "NO/ZERO GRAD")
-        #    else:
-        #        print(n, p.grad.shape)
-        #exit()
-        optimizer.step()
-
-        #new_sd = model.state_dict()
-        #parameter_compare(old_sd, new_sd)
-        #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
-        #exit()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            progress.display(i)
-
-    # Print SS choice counts
-    print("SS Choice Counts:")
-    for i in range(ss_choice_counts.shape[0]):
-        print("SS Block:", i, ss_choice_counts[i])
+#        # Generate SS target
+#        with torch.no_grad():
+#            # Compute task loss
+#            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+#            # Compute ss_target
+#            ss_target = (task_loss.detach() - stage1_avg_loss) / stage1_avg_loss
+#            ss_target = torch.repeat_interleave(ss_target.unsqueeze(1), ss_output.shape[1], dim=1)
+#            # Note that the ss_output and ss_target should be of shape: [N, #adaptive blocks]
+#
+#        # Compute SS loss
+#        ss_loss = criterion(ss_output, ss_target)
+#
+#        # Track choice counts per SS block
+#        for ss_id in range(choices.shape[1]):
+#            for j in range(choices.shape[0]):
+#                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
+#
+#        #print("\noutput:", output.shape)
+#        #print("task loss:", task_loss, task_loss.shape)
+#        #print("choices:", choices, choices.shape)
+#        #print("ss_output:", ss_output, ss_output.shape, ss_output.dtype)
+#        #print("ss_target:", ss_target, ss_target.shape, ss_target.dtype)
+#        #print("ss_loss:", ss_loss, ss_loss.shape)
+#
+#        # measure accuracy and record loss
+#        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+#        losses.update(ss_loss.item(), images.size(0))
+#        top1.update(acc1[0], images.size(0))
+#        top5.update(acc5[0], images.size(0))
+#
+#        # compute gradient and do SGD step
+#        optimizer.zero_grad()
+#        ss_loss.backward()
+#        #for n, p in model.named_parameters():
+#        #    if p.grad is None or p.grad.abs().sum() == 0:
+#        #        print(n, "NO/ZERO GRAD")
+#        #    else:
+#        #        print(n, p.grad.shape)
+#        #exit()
+#        optimizer.step()
+#
+#        #new_sd = model.state_dict()
+#        #parameter_compare(old_sd, new_sd)
+#        #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
+#        #exit()
+#
+#        # measure elapsed time
+#        batch_time.update(time.time() - end)
+#        end = time.time()
+#
+#        if i % args.print_freq == 0:
+#            progress.display(i)
+#
+#    # Print SS choice counts
+#    print("SS Choice Counts:")
+#    for i in range(ss_choice_counts.shape[0]):
+#        print("SS Block:", i, ss_choice_counts[i])
 
 
 
@@ -939,7 +1026,7 @@ def get_valid_stride_combos(args):
 ############################################################################
 ### EVALUATE AND SAVE
 ############################################################################
-def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, selector_truth, args, filename='checkpoint.pth.tar'):
+def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cycle, stage, total_epoch, model_name, args, filename='checkpoint.pth.tar'):
     global best_acc1
     # Evaluate on validation set
     acc1 = validate(val_loader, model, criterion1, args)
@@ -959,7 +1046,6 @@ def evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, cyc
             'best_acc1': best_acc1,
             'optimizer1' : optimizer1.state_dict(),
             'optimizer2' : optimizer2.state_dict(),
-            'selector_truth' : selector_truth,
         }, is_best, outdir=args.outdir, filename=filename)
 
 
@@ -975,6 +1061,16 @@ def save_checkpoint(state, is_best, outdir='./out/test', filename='checkpoint.pt
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(outdir, 'model_best.pth.tar'))
+
+
+
+############################################################################
+### SAVE CHECKPOINT
+############################################################################
+def save_selector_truth(selector_truth, outdir='./out/test', filename='selector_truth.pth.tar'):
+    filepath = os.path.join(outdir, filename)
+    print("Saving selector_truth to: {} ".format(filepath))
+    torch.save(selector_truth, filepath)
 
 
 
@@ -1071,6 +1167,15 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+
+def unravel_index(index, shape):
+    """See numpy's unravel_index function"""
+    out = []
+    for dim in reversed(shape):
+        out.append(index % dim)
+        index = index // dim
+    return tuple(reversed(out))
 
 
 def parameter_compare(old_sd, new_sd):
