@@ -284,10 +284,10 @@ class Strider(nn.Module):
                 # If it is a StriderBlock pass the extra args and get extra return values
                 man = None if len(manual_stride) == 0 else manual_stride[curr_strider_block]
                 x, preds, choice = getattr(self, block_name)(x, epsilon, input_resolution, stage, curr_stride_prefix, man, device)
-                print("preds: {}\t {}\t device: {}".format(preds, preds.shape, preds.get_device()))
+                #print("preds: {}\t {}\t device: {}".format(preds, preds.shape, preds.get_device()))
                 #print("choice: {} {}".format(choice.item(), choice.shape))
                 self.device_sample_counts[preds.get_device()] = preds.shape[0]
-                print("device_sample_counts:", self.device_sample_counts)
+                #print("device_sample_counts:", self.device_sample_counts)
                 all_preds.append(preds)
                 all_choices.append(choice)
                 curr_strider_block += 1

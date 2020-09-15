@@ -29,8 +29,15 @@
 #CUDA_VISIBLE_DEVICES=1 python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" -b 2
 #CUDA_VISIBLE_DEVICES=1 python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_ABCD_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" -b 2
 
-python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" -b 8
-#python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_ABCD_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" -b 8
+#python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" -p 1
+#python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_ABCD_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_ABCD_random/selector_truth.pth.tar" -p 1
+
 
 #python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar"
+#python -u main_adaptive.py "configs/strider/strider_R50_ABCD_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 45 --resume-stage2 "out/strider/strider_R50_ABCD_random/C0_post_S1.pth.tar"
 
+
+### S2 Tests
+python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 30 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" --lr2 0.01 --run-name "rand_lr01"
+#python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 30 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" --lr2 0.001 --run-name "rand_lr001"
+#python -u main_adaptive.py "configs/strider/strider_R50_B_random.yaml" --workers 8 --cycles 1 --stage1-epochs-per-cycle 0 --stage2-epochs-per-cycle 30 --resume-stage2 "out/strider/strider_R50_B_random/C0_post_S1.pth.tar" --load-selector-truth "out/strider/strider_R50_B_random/selector_truth.pth.tar" --lr2 0.0001 --run-name "rand_lr0001"

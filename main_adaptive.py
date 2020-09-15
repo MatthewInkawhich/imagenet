@@ -33,6 +33,8 @@ parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 #                    help='path to dataset')
 parser.add_argument('config', metavar='FILE',
                     help='path to config file')
+parser.add_argument('--run-name', default='', type=str,
+                    help='(optional) name of run within same config')
 #parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
 #                    choices=model_names,
 #                    help='model architecture: ' +
@@ -123,8 +125,11 @@ def main():
     with open(args.config, "r") as yamlfile:
         args.model_cfg = yaml.load(yamlfile, Loader=yaml.FullLoader)
     args.outdir = './out/' + args.config.split('configs/')[-1].split('.')[0]
+    if args.run_name:
+        args.outdir += '/{}'.format(args.run_name)
 
     print("args.config:", args.config)
+    print("args.run_name:", args.run_name)
     print("args.outdir:", args.outdir)
     print("args.model_cfg:", args.model_cfg)
 
@@ -259,9 +264,6 @@ def main_worker(gpu, ngpus_per_node, args):
     optimizer1 = torch.optim.SGD(params1, args.lr1,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    #optimizer2 = torch.optim.SGD(params2, args.lr2,
-    #                            momentum=args.momentum,
-    #                            weight_decay=args.weight_decay)
     optimizer2 = torch.optim.Adam(params2, args.lr2)
 
 
@@ -335,8 +337,8 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################################################
     ### BUILD DATASETS AND DATALOADERS
     ############################################################################
-    #traindir = '/zero1/data1/ILSVRC2012/train/original'
-    traindir = './data/ILSVRC2012_val' 
+    traindir = '/zero1/data1/ILSVRC2012/train/original'
+    #traindir = './data/ILSVRC2012_val' 
     valdir = './data/ILSVRC2012_val' 
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -501,10 +503,9 @@ def train_stage1(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # Iterate over training images
     for i, (images, target, indices) in enumerate(train_loader):
-        print("images:", images.shape)
-        print("target:", target, target.shape)
-        print("indices:", indices, indices.shape)
-        exit()
+        #print("images:", images.shape)
+        #print("target:", target, target.shape)
+        #print("indices:", indices, indices.shape)
         #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
@@ -679,20 +680,32 @@ def collect_selector_truth(data_loader, dataset_length, model, criterion, valid_
 # One full epoch of training SS modules (stage 2)
 def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, selector_truth, args):
     print("Starting Stage 2, Epoch:", epoch)
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}] [{}] S2".format(epoch, total_epoch))
 
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
     num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
+
+    # Initialize meters for each SS module
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    loss_meters = []
+    acc_meters = []
+    all_meters = [batch_time, data_time]
+    for i in range(num_ss_blocks):
+        prefix = "SS-{}".format(i)
+        curr_loss_meter = AverageMeter('{}-Loss'.format(prefix), ':.4e')
+        curr_acc_meter = AverageMeter('{}-Acc'.format(prefix), ':6.2f')
+        loss_meters.append(curr_loss_meter)
+        acc_meters.append(curr_acc_meter)
+        all_meters.append(curr_loss_meter)
+        all_meters.append(curr_acc_meter)
+        
+    progress = ProgressMeter(
+        len(train_loader),
+        all_meters,
+        prefix="Epoch: [{}] [{}] S2".format(epoch, total_epoch))
+
 
     # switch to train mode
     model.train()
@@ -701,6 +714,8 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
     # Iterate over training samples
     for i, (images, target, indices) in enumerate(train_loader):
+        #print("indices:", indices)
+        #print("target:", target, target.shape)
         #old_sd = copy.deepcopy(model.state_dict())
         # measure data loading time
         data_time.update(time.time() - end)
@@ -710,83 +725,88 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
         target = target.cuda(args.gpu, non_blocking=True)
 
         # Forward batch thru model
-        # TEMP: REMOVE AFTER!
-        #epsilon = 0
         output, ss_output, choices = model(images, epsilon, 2, device='cuda')
         device_sample_counts = model.module.get_device_sample_counts()
 
-        print("\n\noutput:", output.shape)
-        print("ss_output:", ss_output, ss_output.shape)
-        print("choices:", choices, choices.shape)
-        print("device_sample_counts:", device_sample_counts)
+        #print("\n\noutput:", output.shape)
+        #print("ss_output:", ss_output, ss_output.shape)
+        #print("choices:", choices, choices.shape)
+        #print("device_sample_counts:", device_sample_counts)
 
-        #ss_output = ss_output.permute(1, 0, 2)
-        #print("\nnew ss_output:", ss_output, ss_output.shape)
-        # Slice ss_output by ss block, compute loss for each block separately and add them
+        # Slice ss_output by ss module, compute loss for each block separately and add them
+        loss = 0
         for ss_id in range(ss_output.shape[1]):
             curr_ss_output = ss_output[:, ss_id, :]
-            print("curr_ss_output:", curr_ss_output, curr_ss_output.shape)
+            #print("\n\ncurr_ss_output:", curr_ss_output, curr_ss_output.shape)
 
-        exit()
+            # Prepare GT for this batch/ss module
+            curr_sample_batch_index = 0
+            ss_target = []
+            for device_id in range(device_sample_counts.shape[0]):
+                # Get prefix for this group
+                curr_stride_option_prefix = tuple(choices[device_id, 0:ss_id].tolist())
+                #print("curr_stride_option_prefix:", curr_stride_option_prefix)
+                # Use prefix to get GT for each sample in this group
+                for k in range(device_sample_counts[device_id]):
+                    # First, get sample_idx (relative to whole dataset)
+                    sample_idx = indices[curr_sample_batch_index]
+                    #print("sample_idx:", sample_idx.item())
+                    # Next, use sample_idx and curr_stride_option_prefix to lookup truth
+                    curr_truth = selector_truth[sample_idx][curr_stride_option_prefix]
+                    #print("curr_truth:", curr_truth)
+                    # Append to ss_target
+                    ss_target.append(curr_truth)
+                    curr_sample_batch_index += 1
+
+            # Compute curr_loss for this SS module
+            ss_target = torch.tensor(ss_target, dtype=torch.int64, device='cuda')
+            #print("ss_target:", ss_target, ss_target.shape)
+            curr_loss = criterion(curr_ss_output, ss_target)
+            #print("curr_loss:", curr_loss)
+            
+            # Add to (total) loss
+            loss += curr_loss    
+
+            # Measure accuracy for current SS module and record loss
+            acc1, _ = accuracy(curr_ss_output, ss_target, topk=(1, 5))
+            loss_meters[ss_id].update(curr_loss.item(), images.size(0))
+            acc_meters[ss_id].update(acc1[0], images.size(0))
+                    
+        #print("\nloss:", loss)
+
+        # Track choice counts per SS block
+        for ss_id in range(choices.shape[1]):
+            for j in range(choices.shape[0]):
+                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
 
 
-#        # Generate SS target
-#        with torch.no_grad():
-#            # Compute task loss
-#            task_loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-#            # Compute ss_target
-#            ss_target = (task_loss.detach() - stage1_avg_loss) / stage1_avg_loss
-#            ss_target = torch.repeat_interleave(ss_target.unsqueeze(1), ss_output.shape[1], dim=1)
-#            # Note that the ss_output and ss_target should be of shape: [N, #adaptive blocks]
-#
-#        # Compute SS loss
-#        ss_loss = criterion(ss_output, ss_target)
-#
-#        # Track choice counts per SS block
-#        for ss_id in range(choices.shape[1]):
-#            for j in range(choices.shape[0]):
-#                ss_choice_counts[ss_id][choices[j][ss_id]] += 1
-#
-#        #print("\noutput:", output.shape)
-#        #print("task loss:", task_loss, task_loss.shape)
-#        #print("choices:", choices, choices.shape)
-#        #print("ss_output:", ss_output, ss_output.shape, ss_output.dtype)
-#        #print("ss_target:", ss_target, ss_target.shape, ss_target.dtype)
-#        #print("ss_loss:", ss_loss, ss_loss.shape)
-#
-#        # measure accuracy and record loss
-#        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-#        losses.update(ss_loss.item(), images.size(0))
-#        top1.update(acc1[0], images.size(0))
-#        top5.update(acc5[0], images.size(0))
-#
-#        # compute gradient and do SGD step
-#        optimizer.zero_grad()
-#        ss_loss.backward()
-#        #for n, p in model.named_parameters():
-#        #    if p.grad is None or p.grad.abs().sum() == 0:
-#        #        print(n, "NO/ZERO GRAD")
-#        #    else:
-#        #        print(n, p.grad.shape)
-#        #exit()
-#        optimizer.step()
-#
-#        #new_sd = model.state_dict()
-#        #parameter_compare(old_sd, new_sd)
-#        #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
-#        #exit()
-#
-#        # measure elapsed time
-#        batch_time.update(time.time() - end)
-#        end = time.time()
-#
-#        if i % args.print_freq == 0:
-#            progress.display(i)
-#
-#    # Print SS choice counts
-#    print("SS Choice Counts:")
-#    for i in range(ss_choice_counts.shape[0]):
-#        print("SS Block:", i, ss_choice_counts[i])
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        #for n, p in model.named_parameters():
+        #    if p.grad is None or p.grad.abs().sum() == 0:
+        #        print(n, "NO/ZERO GRAD")
+        #    else:
+        #        print(n, p.grad.shape)
+        #exit()
+        optimizer.step()
+
+        #new_sd = model.state_dict()
+        #parameter_compare(old_sd, new_sd)
+        #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+            
+
+    # Print SS choice counts
+    print("SS Choice Counts:")
+    for i in range(ss_choice_counts.shape[0]):
+        print("SS Block:", i, ss_choice_counts[i])
 
 
 
