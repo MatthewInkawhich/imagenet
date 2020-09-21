@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -69,6 +70,14 @@ parser.add_argument('--lr1', default=0.1, type=float,
                     metavar='LR', help='initial learning rate for stage 1')
 parser.add_argument('--lr2', default=0.001, type=float,
                     metavar='LR', help='initial learning rate for stage 2')
+parser.add_argument('--lr1-decay-every', default=30, type=int, metavar='N',
+                    help='decay lr1 every _ epochs')
+parser.add_argument('--lr2-decay-every', default=10, type=int, metavar='N',
+                    help='decay lr2 every _ epochs')
+parser.add_argument('--eta', default=1.0, type=float, metavar='N',
+                    help='eta parameter used for calculating S2 cross entropy weights')
+parser.add_argument('--gamma', default=2.0, type=float, metavar='N',
+                    help='gamma parameter used in focal loss')
 
 
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -260,7 +269,6 @@ def main_worker(gpu, ngpus_per_node, args):
             params1.append(p)
 
     criterion1 = nn.CrossEntropyLoss().cuda(args.gpu)
-    criterion2 = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer1 = torch.optim.SGD(params1, args.lr1,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -426,7 +434,7 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################################################
     ### EPOCH LOOP
     ############################################################################
-    # Repeat for args.cycles cycles
+    # Repeat for args.cycles
     for c in range(args.start_cycle, args.cycles):
         print("Starting cycle:", c)
         # Train Stage1
@@ -462,7 +470,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # Update current epoch's epsilon
             epsilon = eps_schedule2[total_epoch].item()
             # Train STAGE2 for one epoch
-            train_stage2(train_loader, model, criterion2, optimizer2, epoch, total_epoch, epsilon, selector_truth, args)
+            train_stage2(train_loader, model, optimizer2, epoch, total_epoch, epsilon, selector_truth, args)
             # Evaluate if necessary
             if total_epoch != 0 and total_epoch % args.evaluate_freq == 0:
                 evaluate_and_save(val_loader, model, optimizer1, optimizer2, criterion1, c, 2, total_epoch, model_name, args)
@@ -678,13 +686,30 @@ def collect_selector_truth(data_loader, dataset_length, model, criterion, valid_
 ### STAGE 2
 ############################################################################
 # One full epoch of training SS modules (stage 2)
-def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, epsilon, selector_truth, args):
+def train_stage2(train_loader, model, optimizer, epoch, total_epoch, epsilon, selector_truth, args):
     print("Starting Stage 2, Epoch:", epoch)
-
     # Initialize counts tensor
     num_ss_blocks = sum([1 if x[0] == 1 else 0 for x in args.model_cfg['STRIDER']['BODY_CONFIG']])
     num_stride_options = len(args.model_cfg['STRIDER']['STRIDE_OPTIONS'])
     ss_choice_counts = torch.zeros(num_ss_blocks, num_stride_options)
+
+    # Get true class counts for each SS module
+    true_class_counts = torch.zeros(num_ss_blocks, num_stride_options)
+    for sample_idx in range(len(selector_truth)):
+        for prefix, truth in selector_truth[sample_idx].items():
+            ss_id = len(prefix)
+            true_class_counts[ss_id][truth] += 1
+
+    # Initialize new criterion object list with updated weights
+    criterions = []
+    for ss_id in range(true_class_counts.shape[0]):
+        curr_class_counts = true_class_counts[ss_id]
+        # Standard inverse
+        weights = (curr_class_counts / curr_class_counts.sum()) ** -1.0
+        # Normalized variant
+        #weights = (-(curr_class_counts / curr_class_counts.sum()) + 1.0) ** args.eta
+        #criterions.append(nn.CrossEntropyLoss(weight=weights).cuda(args.gpu))
+        criterions.append(FocalLoss(weight=weights, gamma=args.gamma, reduction='mean').cuda(args.gpu))
 
     # Initialize meters for each SS module
     batch_time = AverageMeter('Time', ':6.3f')
@@ -761,7 +786,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
             # Compute curr_loss for this SS module
             ss_target = torch.tensor(ss_target, dtype=torch.int64, device='cuda')
             #print("ss_target:", ss_target, ss_target.shape)
-            curr_loss = criterion(curr_ss_output, ss_target)
+            curr_loss = criterions[ss_id](curr_ss_output, ss_target)
             #print("curr_loss:", curr_loss)
             
             # Add to (total) loss
@@ -793,6 +818,7 @@ def train_stage2(train_loader, model, criterion, optimizer, epoch, total_epoch, 
 
         #new_sd = model.state_dict()
         #parameter_compare(old_sd, new_sd)
+        #exit()
         #print("AFTER:", new_sd['module.body.block15.conv3.weight'])
 
         # measure elapsed time
@@ -1138,6 +1164,24 @@ class ProgressMeter(object):
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
+
+############################################################################
+### PERFORMANCE METER CLASSES
+############################################################################
+class FocalLoss(nn.modules.loss._WeightedLoss):
+    def __init__(self, weight=None, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__(weight, reduction=reduction)
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, input, target):
+        ce_loss = F.cross_entropy(input, target,reduction=self.reduction, weight=self.weight)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
+
+
+
 ############################################################################
 ### HELPERS
 ############################################################################
@@ -1165,9 +1209,9 @@ def get_lr(optimizer):
 def adjust_learning_rate(optimizer, stage, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     if stage == 1:
-        lr = args.lr1 * (0.1 ** (epoch // 30))
+        lr = args.lr1 * (0.1 ** (epoch // args.lr1_decay_every))
     else:
-        lr = args.lr2 * (0.1 ** (epoch // 30))
+        lr = args.lr2 * (0.1 ** (epoch // args.lr2_decay_every))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 

@@ -380,14 +380,28 @@ class AdaptiveFusionModule(nn.Module):
 ### StrideSelectorModule
 ################################################################################
 class StrideSelectorModule(nn.Module):
-    def __init__(self, in_channels, intermediate_channels, num_stride_options, striderblock_index):
+    def __init__(self, in_channels, num_stride_options, striderblock_index):
         super(StrideSelectorModule, self).__init__()
         self.num_stride_options = num_stride_options
         self.striderblock_index = striderblock_index
-        self.conv1 = Conv2d(in_channels, intermediate_channels, kernel_size=3, stride=1, padding=1)
-        self.conv2 = Conv2d(intermediate_channels, intermediate_channels, kernel_size=3, stride=1, padding=1)
+
+        self.transition = Conv2d(in_channels, 64, kernel_size=1, stride=1, bias=False)
+
+        # C2
+        self.bb1 = BasicBlock(64, 64, 1)
+        self.bb2 = BasicBlock(64, 64, 1)
+        # C3
+        self.bb3 = BasicBlock(64, 128, 2)
+        self.bb4 = BasicBlock(128, 128, 1)
+        # C4
+        self.bb5 = BasicBlock(128, 256, 2)
+        self.bb6 = BasicBlock(256, 256, 1)
+        # C5
+        self.bb7 = BasicBlock(256, 512, 2)
+        self.bb8 = BasicBlock(512, 512, 1)
+        
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(intermediate_channels + (num_stride_options * striderblock_index), num_stride_options)
+        self.fc = nn.Linear(512 + (num_stride_options * striderblock_index), num_stride_options)
 
     def forward(self, x, stride_prefix, device):
         # Prepare one-hot stride_prefix tensor
@@ -399,9 +413,16 @@ class StrideSelectorModule(nn.Module):
             one_hot_prefix[0, oh_idx] = 1.0 
         # 3) Repeat over dim=0
         one_hot_prefix = torch.repeat_interleave(one_hot_prefix, x.shape[0], dim=0)
-        # Convs
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        # Run convs
+        x = self.transition(x)
+        x = self.bb1(x)
+        x = self.bb2(x)
+        x = self.bb3(x)
+        x = self.bb4(x)
+        x = self.bb5(x)
+        x = self.bb6(x)
+        x = self.bb7(x)
+        x = self.bb8(x)
         # GAP
         x = self.gap(x)
         x = torch.flatten(x, 1)
@@ -458,7 +479,7 @@ class StriderBlock(nn.Module):
 
         ### Conv2 
         self.conv2_stride_options = stride_options
-        self.ss = StrideSelectorModule(bottleneck_channels, ss_channels, len(self.conv2_stride_options), striderblock_index)
+        self.ss = StrideSelectorModule(bottleneck_channels, len(self.conv2_stride_options), striderblock_index)
         self.conv2_weight = nn.Parameter(
             torch.Tensor(bottleneck_channels, bottleneck_channels, 3, 3))
         self.bn2 = norm_func(bottleneck_channels)
@@ -684,3 +705,66 @@ class Bottleneck(nn.Module):
 
 
 
+class BasicBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels, 
+        stride,
+        dilation=1,
+        norm_func=nn.BatchNorm2d,
+    ):
+        super(BasicBlock, self).__init__()
+
+        ### Downsample layer (on residual)
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            down_stride = stride
+            self.downsample = nn.Sequential(
+                Conv2d(
+                    in_channels, out_channels,
+                    kernel_size=1, stride=down_stride, bias=False
+                ),
+                norm_func(out_channels),
+            )
+
+        ### First conv
+        self.conv1 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=dilation,
+            bias=False,
+        )
+        self.bn1 = norm_func(out_channels)
+
+        ### Second conv
+        self.conv2 = Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = norm_func(out_channels)
+
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu_(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = F.relu_(out)
+
+        return out
