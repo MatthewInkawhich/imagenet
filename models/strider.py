@@ -51,7 +51,7 @@ def FeatureResize(x, target_resolution):
 ### Strider Classifier Module
 ################################################################################
 class StriderClassifier(nn.Module):
-    def __init__(self, cfg, num_classes=1000):
+    def __init__(self, cfg, valid_nexts, num_classes=1000):
         super(StriderClassifier, self).__init__()
 
         # Assert correct config format
@@ -60,7 +60,7 @@ class StriderClassifier(nn.Module):
         assert (len(cfg['BODY_CHANNELS']) == len(cfg['DOWNSAMPLE_BOUNDS'])), "Body channels config must equal downsample bounds"
 
         # Build Strider backbone
-        self.body = Strider(cfg)
+        self.body = Strider(cfg, valid_nexts)
 
         # Build FPN
         self.use_fpn = cfg['USE_FPN']
@@ -133,7 +133,7 @@ class StriderClassifier(nn.Module):
 ### Strider Backbone Module
 ################################################################################
 class Strider(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, valid_nexts):
         """
         Arguments:
             cfg object which contains necessary configs for model building and running
@@ -143,6 +143,7 @@ class Strider(nn.Module):
         # Initialize device_sample_counts to use to track # samples on each device during forward
         # Put it on CPU so we can always access it
         self.device_sample_counts = torch.zeros((torch.cuda.device_count()), dtype=torch.int64, device='cpu')
+        self.valid_nexts = valid_nexts
 
         self.norm_func = nn.BatchNorm2d
 
@@ -255,6 +256,13 @@ class Strider(nn.Module):
                 #print("Initializing conv2_weight parameter")
                 nn.init.kaiming_normal_(p, mode='fan_out', nonlinearity='relu')
 
+        # Zero-init last BN in each block
+        # https://arxiv.org/abs/1706.02677
+        for m in self.modules():
+            if isinstance(m, (Bottleneck, StriderBlock)):
+                nn.init.constant_(m.bn3.weight, 0)
+            elif isinstance(m, BasicBlock):
+                nn.init.constatn_(m.bn2.weight, 0)
 
         # Initialize specialty layers
         for m in self.modules():
@@ -266,7 +274,6 @@ class Strider(nn.Module):
 
     def forward(self, x, epsilon, stage, manual_stride, device):
         #print("input:", x.shape)
-        input_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
         all_preds = []
         all_choices = []
         all_outputs = []
@@ -277,15 +284,16 @@ class Strider(nn.Module):
         # Forward thru stem
         with torch.set_grad_enabled(stage==1):
             x = self.stem(x)
-        #print("stem:", x.shape)
+        #print("\nstem:", x.shape)
         for i, block_name in enumerate(self.block_names):
             # Forward thru current block
             if isinstance(getattr(self, block_name), StriderBlock):
                 # If it is a StriderBlock pass the extra args and get extra return values
                 man = None if len(manual_stride) == 0 else manual_stride[curr_strider_block]
-                x, preds, choice = getattr(self, block_name)(x, epsilon, input_resolution, stage, curr_stride_prefix, man, device)
-                #print("preds: {}\t {}\t device: {}".format(preds, preds.shape, preds.get_device()))
-                #print("choice: {} {}".format(choice.item(), choice.shape))
+                curr_valid_nexts = self.valid_nexts[curr_stride_prefix]
+                x, preds, choice = getattr(self, block_name)(x, epsilon, stage, curr_stride_prefix, curr_valid_nexts, man, device)
+                #print("block: {}\t preds: {}\t {}\t device: {}".format(curr_strider_block, preds, preds.shape, preds.get_device()))
+                #print("block: {}\t choice: {}\t device: {}".format(curr_strider_block, choice.item(), choice.get_device()))
                 self.device_sample_counts[preds.get_device()] = preds.shape[0]
                 #print("device_sample_counts:", self.device_sample_counts)
                 all_preds.append(preds)
@@ -296,7 +304,7 @@ class Strider(nn.Module):
                 # If it is NOT a StriderBlock, forward as usual
                 with torch.set_grad_enabled(stage==1):
                     x = getattr(self, block_name)(x)
-            #print("i:{} x:".format(i), x.shape)
+            #print("i:{}\t {}\t device: {}:".format(i, x.shape, x.get_device()))
 
             # Perform long range residual fusion
             with torch.set_grad_enabled(stage==1):
@@ -380,49 +388,59 @@ class AdaptiveFusionModule(nn.Module):
 ### StrideSelectorModule
 ################################################################################
 class StrideSelectorModule(nn.Module):
-    def __init__(self, in_channels, num_stride_options, striderblock_index):
+    def __init__(self, in_channels, ss_channels, num_stride_options, striderblock_index, norm_func):
         super(StrideSelectorModule, self).__init__()
         self.num_stride_options = num_stride_options
         self.striderblock_index = striderblock_index
 
-        self.transition = Conv2d(in_channels, 64, kernel_size=1, stride=1, bias=False)
+        # Transition layer
+        self.transition = Conv2d(in_channels, ss_channels, kernel_size=1, stride=1, bias=False)
+        self.transition_bn = norm_func(ss_channels)
 
-        # C2
-        self.bb1 = BasicBlock(64, 64, 1)
-        self.bb2 = BasicBlock(64, 64, 1)
-        # C3
-        self.bb3 = BasicBlock(64, 128, 2)
-        self.bb4 = BasicBlock(128, 128, 1)
-        # C4
-        self.bb5 = BasicBlock(128, 256, 2)
-        self.bb6 = BasicBlock(256, 256, 1)
-        # C5
-        self.bb7 = BasicBlock(256, 512, 2)
-        self.bb8 = BasicBlock(512, 512, 1)
+        # SSM C2
+        self.b1 = Bottleneck(ss_channels, ss_channels//2, ss_channels*2, 1, 1, norm_func)
+        self.b2 = Bottleneck(ss_channels*2, ss_channels//2, ss_channels*2, 1, 1, norm_func)
+        self.b3 = Bottleneck(ss_channels*2, ss_channels//2, ss_channels*2, 1, 1, norm_func)
+
+        # SSM C3
+        self.b4 = Bottleneck(ss_channels*2, ss_channels, ss_channels*4, 2, 1, norm_func)
+        self.b5 = Bottleneck(ss_channels*4, ss_channels, ss_channels*4, 1, 1, norm_func)
+        self.b6 = Bottleneck(ss_channels*4, ss_channels, ss_channels*4, 1, 1, norm_func)
+        self.b7 = Bottleneck(ss_channels*4, ss_channels, ss_channels*4, 1, 1, norm_func)
         
+        # Flatten
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 + (num_stride_options * striderblock_index), num_stride_options)
+        # Linear
+        self.fc = nn.Linear(ss_channels*4 + (num_stride_options * striderblock_index), num_stride_options)
+
 
     def forward(self, x, stride_prefix, device):
         # Prepare one-hot stride_prefix tensor
         # 1) Initialize current one_hot_prefix tensor (must initialize here because we want it on THIS device (not cuda:0)
-        one_hot_prefix = torch.zeros(1, self.num_stride_options * self.striderblock_index, dtype=torch.float32, device=device)
+        one_hot_prefix = torch.zeros((1, self.num_stride_options * self.striderblock_index), dtype=torch.float32, device=device)
         # 2) Add 1s
         for s_idx in range(len(stride_prefix)):
             oh_idx = (self.num_stride_options * s_idx) + stride_prefix[s_idx]
             one_hot_prefix[0, oh_idx] = 1.0 
         # 3) Repeat over dim=0
         one_hot_prefix = torch.repeat_interleave(one_hot_prefix, x.shape[0], dim=0)
-        # Run convs
+
+        # Run transition
         x = self.transition(x)
-        x = self.bb1(x)
-        x = self.bb2(x)
-        x = self.bb3(x)
-        x = self.bb4(x)
-        x = self.bb5(x)
-        x = self.bb6(x)
-        x = self.bb7(x)
-        x = self.bb8(x)
+        x = self.transition_bn(x)
+        x = F.relu_(x)
+
+        # Run SSM C2
+        x = F.relu(self.b1(x))
+        x = F.relu(self.b2(x))
+        x = F.relu(self.b3(x))
+
+        # Run SSM C3
+        x = F.relu(self.b4(x))
+        x = F.relu(self.b5(x))
+        x = F.relu(self.b6(x))
+        x = F.relu(self.b7(x))
+
         # GAP
         x = self.gap(x)
         x = torch.flatten(x, 1)
@@ -479,7 +497,7 @@ class StriderBlock(nn.Module):
 
         ### Conv2 
         self.conv2_stride_options = stride_options
-        self.ss = StrideSelectorModule(bottleneck_channels, len(self.conv2_stride_options), striderblock_index)
+        self.ss = StrideSelectorModule(bottleneck_channels, ss_channels, len(self.conv2_stride_options), striderblock_index, norm_func)
         self.conv2_weight = nn.Parameter(
             torch.Tensor(bottleneck_channels, bottleneck_channels, 3, 3))
         self.bn2 = norm_func(bottleneck_channels)
@@ -495,37 +513,12 @@ class StriderBlock(nn.Module):
         self.bn3 = norm_func(out_channels)
 
     
-    def select_stride(self, x, epsilon, input_resolution, stride_prefix, manual_stride, device):
-        # Create list of valid stride options based on current resolution and input resolution
-        curr_resolution = torch.tensor(x.shape[-2:], dtype=torch.float32)
-        curr_downsample = torch.ceil(input_resolution / curr_resolution)
-        #print("curr_downsample:", curr_downsample)
-        all_options = list(range(len(self.conv2_stride_options)))
-        invalid_options = []
-        if curr_downsample[0] * 2 > self.downsample_bound[0]:  # Height too small for another downsample
-            invalid_options.extend([2, 3])
-        if curr_downsample[1] * 2 > self.downsample_bound[0]:  # Width too small for another downsample
-            invalid_options.extend([1, 3])
-        if curr_downsample[0] / 2 < self.downsample_bound[1]:  # Height too large for another upsample
-            invalid_options.extend([5, 6])
-        if curr_downsample[1] / 2 < self.downsample_bound[1]:  # Width too large for another upsample
-            invalid_options.extend([4, 6])
-        if curr_downsample[0] > self.downsample_bound[0]:      # Height too small to keep current resolution
-            invalid_options.extend([0, 1, 4])
-        if curr_downsample[1] > self.downsample_bound[0]:      # Width too small to keep current resolution
-            invalid_options.extend([0, 2, 5])
-        if curr_downsample[0] < self.downsample_bound[1]:      # Height too large to keep current resolution
-            invalid_options.extend([0, 1, 4])
-        if curr_downsample[1] < self.downsample_bound[1]:      # Width too large to keep current resolution
-            invalid_options.extend([0, 2, 5])
-        valid_options = [i for i in all_options if i not in invalid_options]
-
-        # Forward pass features thru SS module
-        ss_out = self.ss(x, stride_prefix, device)
-
+    def select_stride(self, x, epsilon, stage, stride_prefix, valid_nexts, manual_stride, device):
         # Select stride using batch majority vote w/ epsilon greedy exploration
         sample = random.random()
         if sample > epsilon:
+            # Forward pass features thru SS module
+            ss_out = self.ss(x, stride_prefix, device)
             # Compute softmax scores for each sample in batch
             ss_out_soft = F.softmax(ss_out, dim=1)
             #print("ss_out:", ss_out, ss_out.shape)
@@ -539,22 +532,24 @@ class StriderBlock(nn.Module):
             # Choose the most confident stride option that is valid
             for opt in sorted_stride_options:
                 opt = opt.item()
-                if opt in valid_options:
+                if opt in valid_nexts:
                     ss_choice = opt 
                     break
+            ss_preds = ss_out.unsqueeze(1)
         else:
-            #print("random!")
-            ss_choice = random.choice(valid_options)
+            # Random choice!
+            ss_choice = random.choice(valid_nexts)
+            # In stage2, ALWAYS forward pass features thru SS module
+            if stage == 2:
+                ss_out = self.ss(x, stride_prefix, device)
+                ss_preds = ss_out.unsqueeze(1)
+            # In stage1, just return a zero vector in place of ss_preds
+            else:
+                ss_preds = torch.zeros((x.shape[0], len(self.conv2_stride_options)), device=device)
 
         # If a manual stride is specified for this block, override choice
         if manual_stride is not None:
             ss_choice = manual_stride
-
-        # Gather loss preds based on selected stride option
-        #ss_preds = ss_out[:, ss_choice].unsqueeze(1)
-
-        # Prepare ss_preds for return
-        ss_preds = ss_out.unsqueeze(1)
 
         # Convert int choice to tensor 
         ss_choice = torch.tensor([[ss_choice]], device=device)
@@ -569,7 +564,7 @@ class StriderBlock(nn.Module):
         return ss_choice, ss_preds
 
 
-    def forward(self, x, epsilon, input_resolution, stage, stride_prefix, manual_stride, device):
+    def forward(self, x, epsilon, stage, stride_prefix, valid_nexts, manual_stride, device):
         with torch.set_grad_enabled(stage==1):
             # Store copy of input feature
             identity = x
@@ -581,8 +576,7 @@ class StriderBlock(nn.Module):
     
         # Select stride for conv2
         with torch.set_grad_enabled(stage==2):
-            ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, input_resolution, stride_prefix, manual_stride, device)
-
+            ss_choice, ss_preds = self.select_stride(conv1_out, epsilon, stage, stride_prefix, valid_nexts, manual_stride, device)
 
         # Forward thru conv2
         with torch.set_grad_enabled(stage==1):
@@ -598,7 +592,7 @@ class StriderBlock(nn.Module):
             out = self.bn2(out)
             out = F.relu_(out)
 
-            # Conv3 stage
+            # Forward thru conv3
             out = self.conv3(out)
             out = self.bn3(out)
 
@@ -700,7 +694,6 @@ class Bottleneck(nn.Module):
 
         out += identity
         #out = F.relu_(out)  # Commenting this out because Strider with LRR connections takes care of this in Strider forward
-
         return out
 
 

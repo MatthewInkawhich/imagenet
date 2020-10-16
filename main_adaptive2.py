@@ -326,7 +326,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # Load current learning rate
             #args.lr1 = get_lr(optimizer1)
             print("=> loaded checkpoint '{}' (cycle {})"
-                  .format(args.resume_stage2, args.start_cycle))
+                  .format(args.resume_old, args.start_cycle))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume_stage2))
             exit()
@@ -411,6 +411,9 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader_stcollect = torch.utils.data.DataLoader(
         train_dataset_s2, batch_size=args.batch_size, shuffle=(train_sampler_s2 is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler_s2, drop_last=False)
+    #train_loader_s2 = torch.utils.data.DataLoader(
+    #    train_dataset_s2, batch_size=args.batch_size, shuffle=(train_sampler_s2 is None),
+    #    num_workers=args.workers, pin_memory=True, sampler=train_sampler_s2, drop_last=False)
 
     if args.batch_eval:
         val_batch_size = args.batch_size
@@ -483,10 +486,10 @@ def main_worker(gpu, ngpus_per_node, args):
         # Get selector truth (if this is not the first S2 train after loading with load_selector_truth)
         if not selector_truth:
             selector_truth = collect_selector_truth(train_loader_stcollect, len(train_dataset_s2), model, valid_combos, args)
-            save_selector_truth(selector_truth, args.outdir)
+            save_selector_truth(selector_truth, args.outdir, "selector_truth_train.pth.tar")
 
-        train_loader_s2 = generate_weighted_loader(train_dataset_s2, selector_truth, len(valid_combos), args)
-        
+        #train_loader_s2 = generate_weighted_loader(train_dataset_s2, selector_truth, len(valid_combos), args)
+        train_loader_s2 = train_loader_stcollect
 
         # Train Stage2
         for epoch in range(args.stage2_epochs_per_cycle):
@@ -599,8 +602,11 @@ def collect_selector_truth(data_loader, dataset_length, model, valid_combos, arg
     # Set to eval mode so we don't change BN averages
     model.eval()
     
-    selector_truth = [-1] * dataset_length
-    best_loss = [10000.0] * dataset_length
+    # Construct empty selector_truth
+    selector_truth = []
+    for i in range(dataset_length):
+        selector_truth.append([[], [], [], [], []])
+
     with torch.no_grad():
         end = time.time()
         for i, (images, target, indices) in enumerate(data_loader):
@@ -612,22 +618,65 @@ def collect_selector_truth(data_loader, dataset_length, model, valid_combos, arg
                 stride_combo = valid_combos[combo_idx]
                 # Compute output
                 output = model(images, stride_combo)
+                soft_output = F.softmax(output, dim=1)
                 # Compute loss for each input in batch
                 loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-                # Check against bests that we already have and update if necessary
-                for batch_sample_idx in range(len(loss)):
-                    sample_idx = indices[batch_sample_idx].item()
-                    if loss[batch_sample_idx] < best_loss[sample_idx]:
-                        # Update best_loss
-                        best_loss[sample_idx] = loss[batch_sample_idx].item()
-                        # Update selector_truth
-                        selector_truth[sample_idx] = combo_idx
+                # Compute correct/incorrect
+                preds = output.argmax(dim=1)
+                corrects = torch.eq(preds, target).int()
 
+                #print("\n\noutput:", output, output.shape)
+                #print("soft_output:", soft_output, soft_output.shape)
+                #print("preds:", preds, preds.shape)
+                #print("target:", target, target.shape)
+                #print("corrects:", corrects, corrects.shape)
+                # Record current corrects and losses for each sample in the batch
+                for batch_sample_idx in range(len(indices)):
+                    sample_idx = indices[batch_sample_idx].item()
+                    task_target = target[batch_sample_idx].item()
+                    pt = soft_output[batch_sample_idx][task_target].item()
+                    #print(sample_idx, pt)
+                    selector_truth[sample_idx][0].append(loss[batch_sample_idx].item())
+                    selector_truth[sample_idx][1].append(pt)
+                    selector_truth[sample_idx][2].append(corrects[batch_sample_idx].item())
+                    selector_truth[sample_idx][3].append(task_target)
+                    selector_truth[sample_idx][4].append(output[batch_sample_idx].tolist())
+            
             # Measure elapsed time and show progress
             batch_time.update(time.time() - end)
             end = time.time()
             if i % args.print_freq == 0:
                 progress.display(i)
+
+#    selector_truth = [-1] * dataset_length
+#    best_loss = [10000.0] * dataset_length
+#    with torch.no_grad():
+#        end = time.time()
+#        for i, (images, target, indices) in enumerate(data_loader):
+#            if args.gpu is not None:
+#                images = images.cuda(args.gpu, non_blocking=True)
+#            target = target.cuda(args.gpu, non_blocking=True)
+#            # Iterate over all valid stride combinations
+#            for combo_idx in range(len(valid_combos)):
+#                stride_combo = valid_combos[combo_idx]
+#                # Compute output
+#                output = model(images, stride_combo)
+#                # Compute loss for each input in batch
+#                loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+#                # Check against bests that we already have and update if necessary
+#                for batch_sample_idx in range(len(loss)):
+#                    sample_idx = indices[batch_sample_idx].item()
+#                    if loss[batch_sample_idx] < best_loss[sample_idx]:
+#                        # Update best_loss
+#                        best_loss[sample_idx] = loss[batch_sample_idx].item()
+#                        # Update selector_truth
+#                        selector_truth[sample_idx] = combo_idx
+#
+#            # Measure elapsed time and show progress
+#            batch_time.update(time.time() - end)
+#            end = time.time()
+#            if i % args.print_freq == 0:
+#                progress.display(i)
 
     return selector_truth
 
@@ -648,10 +697,10 @@ def train_stage2(train_loader, selector, optimizer, epoch, total_epoch, epsilon,
         prefix="Epoch: [{}] [{}] S2".format(epoch, total_epoch))
 
     # Create truth_counts tensor
-    truth_counts = torch.zeros(len(valid_combos))
-    for truth in selector_truth:
-        truth_counts[truth] += 1
-    print("truth_counts:", truth_counts, truth_counts/truth_counts.sum())
+    #truth_counts = torch.zeros(len(valid_combos))
+    #for truth in selector_truth:
+    #    truth_counts[truth] += 1
+    #print("truth_counts:", truth_counts, truth_counts/truth_counts.sum())
 
     # Initialize criterion object
     # Non-weighted
@@ -665,8 +714,8 @@ def train_stage2(train_loader, selector, optimizer, epoch, total_epoch, epsilon,
     #criterion = nn.CrossEntropyLoss(weight=weight).cuda(args.gpu)
 
     # Focal
-    weight = torch.ones(len(valid_combos))
-    criterion = FocalLoss(weight=weight, gamma=args.gamma, reduction='mean').cuda(args.gpu)
+    #weight = torch.ones(len(valid_combos))
+    #criterion = FocalLoss(weight=weight, gamma=args.gamma, reduction='mean').cuda(args.gpu)
 
     #print("weight:", weight)
 
@@ -682,10 +731,11 @@ def train_stage2(train_loader, selector, optimizer, epoch, total_epoch, epsilon,
             images = images.cuda(args.gpu, non_blocking=True)
 
         # Collect truth for SSM
-        target = torch.zeros_like(indices).cuda(args.gpu)
-        for batch_sample_idx in range(len(indices)):
-            sample_idx = indices[batch_sample_idx].item()
-            target[batch_sample_idx] = selector_truth[sample_idx]
+        #target = torch.zeros_like(indices).cuda(args.gpu)
+        #for batch_sample_idx in range(len(indices)):
+        #    sample_idx = indices[batch_sample_idx].item()
+        #    target[batch_sample_idx] = selector_truth[sample_idx]
+        soft_target = generate_soft_targets(indices, selector_truth, args) 
 
 
         #count = [0] * len(valid_combos)
@@ -697,10 +747,13 @@ def train_stage2(train_loader, selector, optimizer, epoch, total_epoch, epsilon,
         # Forward batch thru selector
         output = selector(images)
         # Compute loss
-        loss = criterion(output, target)
+        #loss = criterion(output, target)
+        loss = xent_with_soft_targets(output, soft_target)
 
+        # Generate hard target
+        hard_target = torch.argmax(soft_target, dim=1)
         # measure accuracy and record loss
-        acc1, _ = accuracy(output, target, topk=(1, 2))
+        acc1, _ = accuracy(output, hard_target, topk=(1, 2))
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
 
@@ -1074,7 +1127,7 @@ class ProgressMeter(object):
 
 
 ############################################################################
-### PERFORMANCE METER CLASSES
+### Alternative loss functions
 ############################################################################
 class FocalLoss(nn.modules.loss._WeightedLoss):
     def __init__(self, weight=None, gamma=2, reduction='mean'):
@@ -1089,21 +1142,77 @@ class FocalLoss(nn.modules.loss._WeightedLoss):
         return focal_loss
 
 
+def xent_with_soft_targets(logit_preds, targets):
+    logsmax = F.log_softmax(logit_preds, dim=1)
+    batch_loss = targets * logsmax
+    batch_loss =  -1*batch_loss.sum(dim=1)
+    return batch_loss.mean()
+
+
 
 ############################################################################
 ### HELPERS
 ############################################################################
+def generate_soft_targets(indices, selector_truth, args):
+    soft_targets = []
+    with torch.no_grad():
+        for batch_sample_idx in range(len(indices)):
+            sample_idx = indices[batch_sample_idx].item()
+            corrects = torch.tensor(selector_truth[sample_idx][2], dtype=torch.float32).cuda(args.gpu)
+            if corrects.sum() > 0:
+                curr_st = corrects / corrects.sum()
+            else:
+                curr_st = F.softmax(corrects, dim=0)
+            curr_st.unsqueeze_(0)
+            soft_targets.append(curr_st)
+            #print("corrects:", corrects, corrects.shape)
+            #print("curr_st:", curr_st, curr_st.shape)
+
+        soft_targets = torch.cat(soft_targets)
+        #print("soft_targets:", soft_targets, soft_targets.shape)
+        #exit()
+    return soft_targets
+
+#def generate_soft_targets(indices, selector_truth, args):
+#    soft_targets = []
+#    with torch.no_grad():
+#        for batch_sample_idx in range(len(indices)):
+#            sample_idx = indices[batch_sample_idx].item()
+#            losses = torch.tensor(selector_truth[sample_idx][0]).cuda(args.gpu)
+#            losses.unsqueeze_(0)
+#            curr_st = F.softmax(-(losses * args.eta), dim=1)
+#            soft_targets.append(curr_st)
+#            #print("losses:", losses, losses.shape)
+#            #print("curr_st:", curr_st, curr_st.shape)
+#
+#        soft_targets = torch.cat(soft_targets)
+#        print("soft_targets:", soft_targets, soft_targets.shape)
+#        exit()
+#    return soft_targets
+
+
 def generate_weighted_loader(dataset, truth, nclasses, args):
-    # First, generate weight
+    # First, organize truth properly
+    cls_truth = []
+    for sample_idx in range(len(truth)):
+        curr_losses = torch.tensor(truth[sample_idx][0])
+        curr_truth = torch.argmin(curr_losses).item()
+        cls_truth.append(curr_truth)
+        #print("curr_losses:", curr_losses)
+        #print("curr_truth:", curr_truth)
+
+
+    #exit()
+    # Generate weight
     count = [0] * nclasses
-    for t in truth:
+    for t in cls_truth:
         count[t] += 1
     weight_per_class = [0.] * nclasses
     N = float(sum(count))
     for i in range(nclasses):
         weight_per_class[i] = N/float(count[i])
-    weight = [0] * len(truth)
-    for idx, val in enumerate(truth):
+    weight = [0] * len(cls_truth)
+    for idx, val in enumerate(cls_truth):
         weight[idx] = weight_per_class[val]
 
     # Create the sampler

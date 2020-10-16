@@ -1,0 +1,17 @@
+MODEL: "strider"
+STRIDER:
+  USE_FPN: False
+  STEM_CHANNELS: 64
+  BODY_CHANNELS: [[64, 64, 256], [256, 64, 256], [256, 64, 256], [256, 128, 512], [512, 128, 512], [512, 128, 512], [512, 128, 512],[512, 256, 1024], [1024, 256, 1024], [1024, 256, 1024], [1024, 256, 1024], [1024, 256, 1024], [1024, 256, 1024], [1024, 512, 2048], [2048, 512, 2048], [2048, 512, 2048]]
+  BODY_CONFIG: [[1], [0, [1,1]], [0, [1,1]], [0, [2,1]], [0, [1,1]], [0, [1,1]], [0, [1,1]], [0, [2,1]], [0, [1,1]], [0, [1,1]], [0, [1,1]], [0, [1,1]], [0, [1,1]], [0, [2,1]], [0, [1,1]], [0, [1,1]]]
+  STRIDE_OPTIONS: [[False, [2, 2]], [False, [2, 1]], [False, [1, 2]], [False, [1, 1]]]
+  RETURN_FEATURES: [False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, True]
+  OUT_CHANNELS: 2048
+  SS_CHANNELS: 256
+  FPN_OUT_CHANNELS: 256
+  FULL_RESIDUAL: False
+  LR_RESIDUAL: []
+  LR_ADAPTIVE_FUSION: False
+  FPN_ADAPTIVE_FUSION: False
+  DOWNSAMPLE_BOUNDS: [[64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4], [64,4]]
+  RANDOM_STRIDE: True
